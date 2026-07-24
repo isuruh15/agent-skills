@@ -33,6 +33,13 @@
       "description": "Skills for WSO2 Integrator — write services and integrations in Ballerina, discover connectors and libraries from Ballerina Central, and build, run, and test projects, plus language-server code intelligence for .bal files.",
       "category": "development",
       "tags": ["wso2", "integrator", "ballerina", "integration", "cloud-native"]
+    },
+    {
+      "name": "migrations",
+      "source": "./plugins/migrations",
+      "description": "WSO2 Migrations skills: migrate Mirth Connect channel XML to compilable Ballerina integration projects.",
+      "category": "development",
+      "tags": ["wso2", "migrations", "mirth", "ballerina", "hl7v2"]
     }
   ]
 }
