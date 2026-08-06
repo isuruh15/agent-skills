@@ -100,12 +100,109 @@ observabilityIncluded = true
 | JMS / queuing | `ballerinax/rabbitmq` |
 | HL7v2 → FHIR conversion | `ballerinax/health.hl7v2<ver>.utils.v2tofhirr4` |
 | **Always include** | `xlibb/pipeline`, `ballerina/log`, `ballerina/uuid`, `ballerina/time` |
+| PDF generation | **Do NOT use `ballerina/pdf`** — see note below |
+
+**PDF generation — known JAR conflict:** `ballerina/pdf` pulls in `commons-logging-1.3.4.jar`
+which conflicts with `ballerina-rt-2201.x.jar` at runtime. Until this is fixed upstream in the
+Ballerina stdlib, do NOT add `ballerina/pdf` as a dependency. Instead, generate the document
+as HTML (using `io:fileWriteString`) and emit a stub destination with a clear TODO:
+
+```ballerina
+// TODO: PDF rendering — ballerina/pdf has a known JAR conflict with ballerina-rt-2201.x.
+// Options:
+//   1. Write HTML output and convert externally (e.g. wkhtmltopdf, headless Chrome).
+//   2. Bundle a conflict-free PDF JAR as a platform dependency in Ballerina.toml and call
+//      it via Ballerina Java interop.
+//   3. Wait for the upstream ballerina/pdf fix and add the dependency then.
+// For now this destination writes an HTML file as a stand-in.
+@pipeline:DestinationConfig {id: "generate_pdf_document"}
+isolated function generatePdfDocument(pipeline:MessageContext msgCtx) returns string|error {
+    string htmlContent = check buildHtmlReport(msgCtx);   // see buildHtmlReport below
+    string outputPath = string `${pdfOutputDirectory}/${check buildFilename(msgCtx)}.html`;
+    check io:fileWriteString(outputPath, htmlContent);
+    log:printInfo("HTML stand-in written (replace with PDF renderer)", filePath = outputPath);
+    return outputPath;
+}
+```
 
 **HL7v2 version package selection:**
 - `hl7v23` for HL7 2.3 / 2.3.1 — `hl7v24` for 2.4 — `hl7v25`/`hl7v251` for 2.5/2.5.1
 - `hl7v26` for 2.6 — `hl7v27` for 2.7 — `hl7v28` for 2.8
 
 If not explicit in the channel XML, check `MSH.12` in example messages. Default to `hl7v23` for old channels.
+
+---
+
+## Phase 2b: Database Reader — Column Types and Nullability
+
+When the source connector is `com.mirth.connect.connectors.jdbc.DatabaseReader`, the SELECT query columns become fields on a Ballerina record. Apply these rules before generating `types.bal`:
+
+### SQL → Ballerina type mapping
+
+| PostgreSQL / SQL type | Ballerina type |
+|---|---|
+| `serial`, `integer`, `int`, `int4`, `int2`, `smallint` | `int` |
+| `bigint`, `int8` | `int` |
+| `varchar`, `text`, `char`, `character varying` | `string` |
+| `boolean`, `bool` | `boolean` |
+| `numeric`, `decimal`, `real`, `double precision`, `float8` | `decimal` |
+| `timestamp`, `timestamptz`, `date`, `time` | `string` (store as text; parse with `ballerina/time` if arithmetic is needed) |
+| `uuid` | `string` |
+| `json`, `jsonb` | `json` |
+| `bytea` | `byte[]` |
+
+**Never default a primary key column to `string` just because it appears in a `SELECT` list. If the column is `serial` or `integer`, always generate `int`.**
+
+### Nullable columns → optional types
+
+**Default every column to optional (`type?`) unless you have explicit evidence it is `NOT NULL`.**  A `NULL` from PostgreSQL binds as `()` in Ballerina; if the record field is non-optional (`string` instead of `string?`) the SQL result stream will panic at runtime with:
+
+```
+invalid value for record field 'col': expected value of type 'string', found '()'
+```
+
+Evidence for `NOT NULL` includes: the column is the table's primary key, the Mirth XML or a comment explicitly states the column is required, or there is a `COALESCE`/`ISNULL` call in the SELECT query that guarantees a non-null result.
+
+```ballerina
+// Example: newpatients table where only lastname, firstname, gender are NOT NULL
+public type NewPatientRow record {|
+    int     newpatients_newpatientid;   // serial PK — always int, never string?
+    string  newpatients_lastname;       // NOT NULL
+    string  newpatients_firstname;      // NOT NULL
+    string? newpatients_middlename;     // nullable — must be string?
+    string  newpatients_gender;         // NOT NULL
+    string? newpatients_dateofbirth;    // nullable — must be string?
+    string? newpatients_ssn;            // nullable — must be string?
+|};
+```
+
+### PostgreSQL INSERT in tests — use `queryRow` + `RETURNING`, never `execute` + `lastInsertId`
+
+`sql:ExecutionResult.lastInsertId` returns `()` for PostgreSQL (the driver does not surface the generated key). Use `queryRow` with a `RETURNING` clause instead:
+
+```ballerina
+// CORRECT — works with PostgreSQL
+function insertPatient(string lastName, string firstName, string gender,
+                       string? middleName = (), string? dob = (),
+                       string? ssn = ()) returns int|error {
+    int lastId = check testDbClient->queryRow(`
+        INSERT INTO newpatients (lastname, firstname, middlename, gender, dateofbirth, ssn, processed)
+        VALUES (${lastName}, ${firstName}, ${middleName}, ${gender}, ${dob}, ${ssn}, false)
+        RETURNING newpatientid
+    `);
+    return lastId;
+}
+
+// WRONG — lastInsertId is always () on PostgreSQL; do not generate this pattern
+function insertPatientBad(...) returns int|error {
+    sql:ExecutionResult result = check testDbClient->execute(`INSERT ...`);
+    int|string? id = result.lastInsertId;
+    if id is () {
+        return error("Could not retrieve id after INSERT");  // always hit on PostgreSQL
+    }
+    return <int>id;
+}
+```
 
 ---
 
@@ -176,7 +273,39 @@ Every Mirth channel is a pipeline: source → preprocessor → source filter/tra
 | Destination connector | `@pipeline:DestinationConfig` function |
 | Multiple destinations | Multiple destination functions — run **in parallel** automatically |
 | Destination filter | Per-destination `FilterConfig` processor or `MessageMetadata.destinationsToSkip` |
+| **Destination transformer** | **Inline inside the destination function — NOT a shared processor** |
 | Response Transformer / Postprocessor | Logic inside the destination function after the send call |
+
+**Destination transformer scoping — critical rule:**
+In Mirth, each destination has its own transformer that runs only for that destination.
+`processors = [...]` in `HandlerChain` runs before **all** destinations — putting a
+destination-scoped transformer there mutates the shared message content and corrupts every
+other destination.
+
+- **Source transformer** → goes in `processors` (runs once, shared across all destinations)
+- **Destination transformer** → goes **inside the destination function body**, applied only to
+  that destination's local copy of the content
+
+```ballerina
+// CORRECT — D1 has a source-level transformer (shared); D2 has its own transformer (scoped).
+//
+// processors = [buildLabReport]          ← source transformer only
+// destinations = [writeLabReportFile, alterAndForwardMessage]
+//
+// The D2-scoped alteration lives inside alterAndForwardMessage, not in processors.
+
+@pipeline:DestinationConfig {id: "alter_and_forward"}
+isolated function alterAndForwardMessage(pipeline:MessageContext msgCtx) returns hl7v2:Message|error {
+    hl7v2:Message msg = check msgCtx.getContentWithType();
+    // D2 destination transformer logic — runs only for this destination
+    hl7v2:Message altered = check applyD2Transformation(msg);
+    // ... send altered message downstream
+    return altered;
+}
+
+// WRONG — putting a D2-only transformer in processors mutates the message for D1 as well.
+// processors = [buildLabReport, alterMessageForForwarding]  // BAD
+```
 
 ### HandlerChain skeleton
 
@@ -186,8 +315,15 @@ import ballerinax/rabbitmq;
 
 // Failure stores — use rabbitmq:MessageStore or any pipeline:Store implementation.
 // Omit replayListenerConfig entirely if the original channel has no persistent queue ("Never" mode).
-final rabbitmq:MessageStore failureStore   = check new ("channel-failure-store");
-final rabbitmq:MessageStore deadLetterStore = check new ("channel-dead-letter-store");
+//
+// IMPORTANT — RabbitMQ 4.x rejects queue declarations with durable=false or autoDelete=true.
+// Every rabbitmq:MessageStore (failureStore, deadLetterStore, replayStore, or any extra store)
+// MUST pass declareQueue = {queueConfig: {durable: true, autoDelete: false}}.
+// Never use the bare check new("name") form.
+final rabbitmq:MessageStore failureStore = check new ("channel-failure-store",
+    declareQueue = {queueConfig: {durable: true, autoDelete: false}});
+final rabbitmq:MessageStore deadLetterStore = check new ("channel-dead-letter-store",
+    declareQueue = {queueConfig: {durable: true, autoDelete: false}});
 
 final pipeline:HandlerChain channelPipeline = check new (
     name = "<channel-name>",
@@ -362,6 +498,40 @@ isolated function extractPatient(pipeline:MessageContext msgCtx) returns Patient
 }
 ```
 
+**`ensureType` vs generic segment access — choose based on what the Mirth JS does:**
+
+| Mirth JS pattern | What it means | Ballerina equivalent |
+|---|---|---|
+| Checks message type first, then accesses type-specific fields | Type is known and fixed | `ensureType(hl7v23:ADT_A01)` — safe to use with `check` |
+| Accesses segments directly without checking message type (e.g. `msg['AL1']`, `msg['OBX']`) | Works on any message type that contains those segments | `msg.getSegments("AL1")` — generic, message-type-agnostic |
+
+Using `check msg.ensureType(hl7v24:ADT_A01)` when the Mirth code accesses segments generically is a bug: `ensureType` returns an error for any non-A01 message type, `check` propagates that error, and the pipeline routes the message to the `failureStore` instead of returning `false` cleanly.
+
+```ballerina
+// CORRECT — generic segment iteration (matches Mirth msg['AL1'] loop)
+// Works for ADT A01, A03, A08, or any other message type that carries AL1 segments.
+@pipeline:FilterConfig {id: "filter_penicillin_allergy"}
+isolated function filterPenicillinAllergy(pipeline:MessageContext msgCtx) returns boolean|error {
+    hl7v2:Message msg = check msgCtx.getContentWithType();
+    hl7v2:Segment[] al1Segments = msg.getSegments("AL1");
+    foreach hl7v2:Segment al1 in al1Segments {
+        string allergenText = check al1.getField(3).getComponent(2);
+        if allergenText.toUpperAscii() == "PENICILLIN" {
+            return true;
+        }
+    }
+    return false;
+}
+
+// WRONG — hard-cast locks the filter to ADT A01 only; all other ADT types go to failureStore.
+isolated function filterPenicillinAllergyBad(pipeline:MessageContext msgCtx) returns boolean|error {
+    hl7v2:Message msg = check msgCtx.getContentWithType();
+    hl7v24:ADT_A01 adtMsg = check msg.ensureType(hl7v24:ADT_A01);  // BAD: fails for A03, A08, etc.
+    hl7v24:AL1[] al1Segments = adtMsg.al1;
+    ...
+}
+```
+
 **HL7v2 field access — always use optional chaining, never assume fields exist:**
 
 ```ballerina
@@ -387,19 +557,38 @@ Read downstream with: `boolean exists = check msgCtx.getPropertyWithType("patien
 
 ### Destinations — translate Mirth destination connectors
 
+**Always declare `http:Client` (and `ftp:Client`, `sql:Client`, etc.) as module-level `final` variables,
+never inside the destination function.** Module-level `final` variables are immutable bindings and are
+safe to access from `isolated` functions. Creating a client inside the function allocates a new
+connection on every message and defeats connection pooling.
+
 ```ballerina
+// Module level — declared once, reused across all messages.
+// 'final' makes it accessible from isolated destination functions.
+configurable string fhirServerUrl = "http://localhost:8080/fhir";
+final http:Client fhirClient = check new (fhirServerUrl);
+
 @pipeline:DestinationConfig {
     id: "send_to_fhir",
     retryConfig: {maxRetries: 3, retryInterval: 2}
 }
 isolated function sendToFhirServer(pipeline:MessageContext msgCtx) returns json|error {
     PatientRecord patient = check msgCtx.getContentWithType();
-    http:Client fhirClient = check new (fhirServerUrl);
     json response = check fhirClient->/Patient.post(patient);
     // Response transformer equivalent: inspect response here before returning
     return response;
 }
+
+// WRONG — do not generate this pattern: creates a new TCP connection on every message.
+isolated function sendToFhirServerBad(pipeline:MessageContext msgCtx) returns json|error {
+    http:Client fhirClient = check new (fhirServerUrl);  // BAD: per-request client
+    ...
+}
 ```
+
+This rule applies to every outbound client type: `http:Client`, `ftp:Client`, `sql:Client`,
+`email:SmtpClient`, etc. The only exception is `tcp:Client` for raw MLLP senders where the
+protocol requires a fresh connection per message.
 
 ---
 
@@ -492,6 +681,25 @@ Translate to idiomatic Ballerina:
 string formatted = convertHl7Date(rawDate);
 ```
 
+**HL7 timestamp generation (`MSH.7` / `DateUtil.formatDate` → `yyyyMMddHHmmss`):**
+
+`time:Civil.second` is `decimal?`. Never cast it as `<int>(<decimal>civil.second)` — the
+inner `<decimal>` cast is redundant (it is already `decimal?`) and the bare `<int>` cast
+is not type-safe. Always use type narrowing + `.floor().toInt()`:
+
+```ballerina
+// CORRECT
+time:Utc now = time:utcNow();
+time:Civil civil = time:utcToCivil(now);
+int secondInt = civil.second is decimal s ? s.floor().toInt() : 0;
+string pad2 = isolated function(int n) returns string => n < 10 ? "0" + n.toString() : n.toString();
+string ts = string `${civil.year}${pad2(civil.month)}${pad2(civil.day)}${pad2(civil.hour)}${pad2(civil.minute)}${pad2(secondInt)}`;
+
+// WRONG — do not generate either of these forms
+int bad1 = <int>(<decimal>civil.second);   // redundant double cast, not type-safe
+int bad2 = civil.second is () ? 0 : <int>(<decimal>civil.second);  // same problem in ternary
+```
+
 ### Case B: Moderate complexity — typed helper stub
 
 When the logic is non-trivial but inputs and outputs are clear, write a full typed signature with a comment block describing the contract precisely:
@@ -572,6 +780,21 @@ isolated function lookupOrAssignMrn(string patientId, string dateOfBirth,
 
 Always externalize connection parameters. Never hardcode hosts, ports, credentials, or paths in `.bal` files.
 
+**Config.toml is mandatory for every generated project, not just those with DB connections.**
+Always emit it even when all configurable variables have defaults — it serves as self-documenting
+runtime configuration.
+
+**Critical rule — every `configurable var = ?` MUST have a corresponding entry in Config.toml.**
+`= ?` means the variable has no default; Ballerina will crash at startup before any application
+code runs if a value is absent. Use a safe placeholder and a comment explaining what to set:
+
+| Variable type | Placeholder | Comment |
+|---|---|---|
+| Password / secret | `""` | `# required — set via env: BAL_CONFIG_SECRET_<var>` |
+| URL without known default | `"http://localhost:8080"` | `# required — set to actual downstream URL` |
+| Host without known default | `"localhost"` | `# required — set to actual host` |
+| Port without known default | `0` | `# required — set to actual port` |
+
 ```toml
 mllpListenPort = 2575
 destinationHost = "localhost"
@@ -582,7 +805,7 @@ outputDirectory = "./output"
 host = "localhost"
 port = 3306
 user = "dbuser"
-password = ""   # set via environment: BAL_CONFIG_SECRET_db_password
+password = ""   # required — set via environment: BAL_CONFIG_SECRET_db_password
 database = "mirthdb"
 ```
 
@@ -651,7 +874,7 @@ After all files, include a **Migration Notes** section with these subsections:
 |---|---|
 | `MessageBuilderStep` | Record field assignment in a `TransformerConfig` |
 | `MapperStep` | Direct assignment or `match` expression |
-| `IteratorStep` | `foreach` loop; nested iterators → nested `foreach` |
+| `IteratorStep` | `foreach` loop over `msg.getSegments("SEG")` (generic) or typed record field (when message type is fixed); nested iterators → nested `foreach` |
 | `JavaScriptStep` (simple) | Translate directly (Case A) |
 | `JavaScriptStep` (moderate) | Typed stub with contract comment (Case B) |
 | `JavaScriptStep` (complex/stateful) | Typed stub with full contract description (Case C) |
