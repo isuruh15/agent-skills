@@ -35,11 +35,11 @@
       "tags": ["wso2", "integrator", "ballerina", "integration", "cloud-native"]
     },
     {
-      "name": "migrations",
-      "source": "./plugins/migrations",
-      "description": "WSO2 Migrations skills: migrate Mirth Connect channel XML to compilable Ballerina integration projects.",
+      "name": "healthcare",
+      "source": "./plugins/healthcare",
+      "description": "WSO2 Healthcare skills: migrate Mirth Connect channel XML to compilable Ballerina integration projects.",
       "category": "development",
-      "tags": ["wso2", "migrations", "mirth", "ballerina", "hl7v2"]
+      "tags": ["wso2", "healthcare", "mirth", "ballerina", "hl7v2", "fhir"]
     }
   ]
 }
