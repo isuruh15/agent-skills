@@ -100,6 +100,45 @@ Each plugin is packaged for both Claude Code and Codex from the same `skills/` c
 
 6. **List the plugin** in the top-level [README.md](./README.md) Plugins table.
 
+## Referencing a Plugin From Another Repo
+
+A plugin maintained elsewhere does not need a copy here. Give its marketplace entry a source object
+instead of a relative path and skip steps 1-4 above — there is no `plugins/<name>/` directory:
+
+```json
+{
+  "name": "<plugin-name>",
+  "source": { "source": "url", "url": "https://github.com/<owner>/<repo>.git", "ref": "main" },
+  "displayName": "<Display Name>",
+  "description": "Short description.",
+  "category": "development",
+  "tags": ["wso2", "<topic>"]
+}
+```
+
+Use `url` with an explicit HTTPS clone URL for a plugin at a repo root, or `git-subdir` with `url` +
+`path` for one inside a monorepo. Both accept `ref` (branch or tag) and `sha` to pin a version.
+
+Prefer `url` over the `{"source": "github", "repo": "<owner>/<repo>"}` shorthand: the shorthand
+clones over SSH and install fails outright with `git@github.com: Permission denied (publickey)` for
+anyone without a GitHub SSH key, whereas an `https://` URL works for everyone.
+
+Worth knowing before you write the entry:
+
+- Claude Code cannot read the referenced `plugin.json` until after install, so only the entry's own
+  fields appear in the listing — set at least `displayName` and `description`. The entry `name` is
+  what `/plugin install <name>@wso2-agent-skills` takes, and it need not match the upstream plugin's
+  name.
+- Do not set `version` on the entry — the referenced `plugin.json` value wins silently. Pin with
+  `ref` or `sha` instead.
+- Add a matching Codex entry to `.agents/plugins/marketplace.json` —
+  `{"source": "url", "url": "<clone-url>"}` — **only if** the referenced repo ships
+  `.codex-plugin/plugin.json`; without it there is nothing for Codex to install. Codex entries carry
+  only `name`, `source`, `policy` and `category`, so no description can be overridden there.
+- `npx skills add wso2/agent-skills` will not find the plugin: the skills CLI discovers only
+  `SKILL.md` files present in the repo it is pointed at. Name the upstream repo in the README so
+  those users can install it directly.
+
 ## Local Development
 
 To test a plugin without publishing, point Claude Code at the plugin directory directly:
@@ -132,7 +171,7 @@ The validator checks each skill and manifest for:
 - **SKILL.md frontmatter** — `name` present, lowercase kebab-case, ≤64 chars, and **matching its directory name**; `description` present and ≤1024 chars; `compatibility` ≤500 chars; only spec-allowed frontmatter keys (`name`, `description`, `license`, `allowed-tools`, `metadata`, `compatibility`). Frontmatter is parsed with the `yaml` package, so malformed YAML fails the check.
 - **Reference paths** — every `references/`, `scripts/`, or `assets/` file mentioned in a `SKILL.md` actually exists.
 - **plugin.json** — valid JSON, `name` present and lowercase kebab-case, valid semver `version` if set.
-- **marketplace.json** — valid JSON, every `source` starts with `./` and resolves to a real directory, and every plugin on disk is listed (and vice versa).
+- **marketplace.json** — valid JSON, every local `source` starts with `./` and resolves to a real directory, and every plugin on disk is listed. An entry whose `source` is an object refers to a plugin in another repo: its type must be one of `github`, `url`, `git-subdir` or `npm` and carry that type's required field, but nothing local is checked for it.
 - **Body size** (warning only) — `SKILL.md` over 500 lines, per spec guidance.
 
 The workflow additionally runs `node --check` / `bash -n` on bundled scripts to catch syntax errors before merge.

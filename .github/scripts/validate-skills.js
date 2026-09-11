@@ -45,6 +45,16 @@ const BODY_SOFT_LIMIT = 500; // lines — spec guidance, warn only
 const REF_EXT = "jsonc|json|yaml|yml|html|mjs|cjs|md|js|sh|txt|png|svg";
 const REF_RE = new RegExp(`(references|scripts|assets)/[A-Za-z0-9._/-]+\\.(?:${REF_EXT})(?![A-Za-z0-9])`, "g");
 
+// Source types for a plugin kept in another repo, and the field each one requires.
+// Claude Code also accepts "archive" and "command"; both are withheld until a
+// marketplace entry needs them. https://code.claude.com/docs/en/plugin-marketplaces
+const REMOTE_SOURCES = {
+  github: "repo",
+  url: "url",
+  "git-subdir": "url",
+  npm: "package",
+};
+
 // --- Helpers --------------------------------------------------------------
 function dirs(p) {
   if (!existsSync(p)) return [];
@@ -196,8 +206,19 @@ function validatePlugins() {
     const tag = `${mktRel} (plugin "${hasName ? entry.name : "<missing-name>"}")`;
     if (!hasName) err(tag, "missing required field: name");
     else listed.add(entry.name);
+    // A referenced plugin's files live in another repo, so there is nothing here to check.
+    let referenced = false;
     if (!entry.source) {
       err(tag, "missing source");
+    } else if (typeof entry.source !== "string") {
+      referenced = true;
+      const kind = Array.isArray(entry.source) ? undefined : entry.source.source;
+      const required = typeof kind === "string" && Object.hasOwn(REMOTE_SOURCES, kind) ? REMOTE_SOURCES[kind] : undefined;
+      if (!required) {
+        err(tag, `source type ${JSON.stringify(kind)} is not permitted here (use: ${Object.keys(REMOTE_SOURCES).join(", ")})`);
+      } else if (typeof entry.source[required] !== "string" || entry.source[required].trim() === "") {
+        err(tag, `source type "${kind}" requires a non-empty "${required}"`);
+      }
     } else if (!entry.source.startsWith("./")) {
       err(tag, `source "${entry.source}" must start with "./"`);
     } else {
@@ -206,7 +227,7 @@ function validatePlugins() {
         err(tag, `source "${entry.source}" does not resolve to a directory`);
       }
     }
-    if (hasName && !knownPlugins.has(entry.name)) {
+    if (!referenced && hasName && !knownPlugins.has(entry.name)) {
       err(tag, `not found among plugin manifests (${[...knownPlugins].join(", ") || "none"})`);
     }
   }

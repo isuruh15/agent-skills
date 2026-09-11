@@ -8,6 +8,7 @@ Official Agent skills for building and managing with WSO2 products.
 |--------|-------------|
 | [api-platform](./plugins/api-platform/README.md) | Design, assess, and fix OpenAPI specs; deploy and manage APIs via the WSO2 API Gateway |
 | [agent-manager](./plugins/agent-manager/README.md) | Deploy and inspect agents; tail logs, metrics, and traces; triage runtime failures |
+| [integrator](https://github.com/ballerina-platform/skills) | Write integrations in Ballerina, discover connectors from Ballerina Central, run and test projects; `.bal` code intelligence |
 
 ## Installation
 
@@ -16,6 +17,13 @@ Official Agent skills for building and managing with WSO2 products.
 Install all WSO2 skills:
 ```
 npx skills add wso2/agent-skills
+```
+
+The `integrator` plugin is referenced from [ballerina-platform/skills](https://github.com/ballerina-platform/skills) rather than
+vendored here, and the `skills` CLI only discovers skills stored in the repo it is given. Install it
+from its own repo:
+```
+npx skills add ballerina-platform/skills
 ```
 
 ### Option 2 - Claude Code
@@ -29,6 +37,7 @@ Install a plugin:
 ```
 /plugin install api-platform@wso2-agent-skills
 /plugin install agent-manager@wso2-agent-skills
+/plugin install integrator@wso2-agent-skills
 ```
 
 ### Option 3 - Codex
