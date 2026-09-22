@@ -38,8 +38,9 @@ copies from the live skill.
   Either way, pin a version for reproducible runs (`@<version>` or a specific
   global version). Note: a suite's own `npm install` only pulls the agent SDK(s)
   the providers need — not promptfoo.
-- **Auth** — either run `claude` (Claude) and/or `codex` (Codex) once to reuse
-  your interactive login, or export `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`.
+- **Auth** — run `claude` (Claude) and/or `codex` (Codex) once; the agent-SDK
+  providers reuse that interactive login, so local runs need no API key. Set
+  `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` only where no login exists, such as CI.
 
 ## Scaffold a new suite
 
@@ -147,7 +148,8 @@ npx promptfoo@latest view
 
 - **Node** `>= 22.22` is required by promptfoo.
 - **Auth:** the agent-SDK providers reuse your interactive login — run `claude`
-  (Claude) or `codex` (Codex) once — or set `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`.
+  (Claude) or `codex` (Codex) once. No API key is needed locally; set
+  `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` only where no login exists, such as CI.
 - **Validate first / after upgrades:** every config pins
   `$schema=https://promptfoo.dev/config-schema.json`, so config-format changes in
   a new promptfoo release surface as validation errors, not silent drift. Run

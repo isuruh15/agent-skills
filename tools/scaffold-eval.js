@@ -179,8 +179,8 @@ write('promptfooconfig.yaml', `# yaml-language-server: $schema=https://promptfoo
 #   npx promptfoo@latest view
 #
 # Requires Node >= 22.22 and provider auth: run \`claude\` once (Claude) and/or
-# \`codex\` once (Codex — logs in via your ChatGPT account), or set
-# ANTHROPIC_API_KEY / OPENAI_API_KEY.
+# \`codex\` once (Codex — logs in via your ChatGPT account). No API key is needed
+# locally; set ANTHROPIC_API_KEY / OPENAI_API_KEY only where no login exists (CI).
 # After editing the skill, refresh the fixture copies from the repo root:
 #   node tools/sync-fixtures.js ${plugin} ${skill}
 
@@ -303,7 +303,7 @@ workspace. See [EVALS.md](../../../../../EVALS.md) at the repo root for the full
 
 \`\`\`bash
 npm install                      # installs the agent SDK(s)
-# log in once if you don't use an API key:
+# log in once (no API key needed locally):
 #   claude        (Claude)   /   codex        (Codex)
 npx promptfoo@latest eval -c promptfooconfig.yaml -o output.json --no-cache --no-share
 npx promptfoo@latest view
