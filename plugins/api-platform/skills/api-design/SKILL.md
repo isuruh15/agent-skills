@@ -1,6 +1,6 @@
 ---
 name: api-design
-description: >
+description: >-
   Use this skill to design an OpenAPI spec from scratch, assess an existing spec for
   AI agent readiness, security, or design quality, or fix issues found in a spec.
   Trigger when the user describes an API they want to build, asks to "design", "create",
