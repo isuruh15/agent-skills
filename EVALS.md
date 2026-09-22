@@ -101,6 +101,40 @@ scores stay comparable across the providers-under-test.
 `skill-used` is asserted **per test**, not globally, so negative cases can use
 `not-skill-used`.
 
+## Asserting on what the agent did, not what it said
+
+The Claude Agent SDK provider returns every tool call the agent made — name,
+input, output — as `metadata.toolCalls` on the result (also saved in
+`output.json`). For a skill that runs a CLI or edits files, that list is the
+evidence, and the agent's closing message is only its own account of it. Two
+patterns follow:
+
+- **Deterministic checks read the tool calls.** A `javascript` assertion pointed
+  at a `file://` module receives `context.metadata.toolCalls`, so it can assert
+  that the login check ran before any create command, that the ID the CLI printed
+  is the one written into the app, or that no command carried a secret. Keep the
+  checks in one module per suite and pick them per test through `vars`
+  (e.g. `checks: [statusFirst, appCreated]` with parameters in `expect: {…}`),
+  so every test shares one set of rules instead of restating them.
+- **Show the rubric grader the trace.** `llm-rubric` sees only the final reply.
+  A `defaultTest.options.transform: file://assert/trace.js` that appends the
+  commands run and files written to the reply lets one rubric judge tool-level
+  behaviour it would otherwise fail for "not being mentioned". Have the
+  deterministic module cut the output at the trace marker so the trace never
+  trips a leak check.
+
+Reserve rubrics for judgement — does the code follow the quickstart, is the
+explanation right — and move anything checkable into JavaScript. A rubric that
+fails because the reply "never mentions" a step the agent actually ran is a
+grader problem, not a skill problem; the trace fixes it.
+
+When a skill talks to a real service, stub it for the default suite: a fake
+CLI on the fixture's PATH that prints what the real one prints (copy output
+strings and `--help` text from the real tool, and reject flags it does not
+define) proves the skill's process with no credentials and no side effects. A
+live run against a sandbox account is a separate, scheduled tier that proves the
+tool still accepts those commands.
+
 ## Running
 
 From a skill's `evals/` directory:
@@ -145,5 +179,17 @@ node tools/sync-fixtures.js --all              # every skill that has evals/
 - **Codex `skill-used` is heuristic.** Codex has no first-class skill event;
   promptfoo infers usage from shell commands that read `SKILL.md` at the
   `.agents/skills/` path. Treat a single Codex `skill-used` failure as soft.
+- **The scaffold allows only `Read`, `Grep`, `Glob`.** A skill that runs a CLI,
+  edits the fixture project or reads docs needs `Bash`, `Write`, `Edit` or
+  `WebFetch` added to `append_allowed_tools`, or every such call is denied and
+  the agent improvises. `AskUserQuestion` is not available headless: put the
+  answers the skill would ask for, and the plan approval, in the prompt.
+- **Runs that edit fixtures need a reset.** Commit the fixture projects, then
+  restore them after a run with `git checkout -- <evals>/fixtures/workspace/<apps>`
+  plus `git clean -fd` on that path (a `reset` script in the suite's
+  `package.json` is the convention). Until the fixtures are committed there is
+  nothing to restore from.
+- **`--filter-pattern "<description substring>"` re-runs a subset** and `-j 1`
+  makes a stubbed CLI's shared state file safe; `-j 2` is a good default.
 - **Cost.** Agent-SDK evals are multi-turn and graded — each run bills the API.
   Run them on changed skills, not on every save.
