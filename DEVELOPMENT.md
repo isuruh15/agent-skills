@@ -17,6 +17,7 @@ plugins/
         SKILL.md                  — skill definition (triggers, workflow, allowed tools)
         references/               — reference docs the skill loads on demand
         scripts/                  — helper scripts the skill invokes
+        evals/                    — promptfoo eval suite for the skill (see EVALS.md)
 ```
 
 Each plugin is packaged for both Claude Code and Codex from the same `skills/` content. The two manifests and two marketplace files must stay in sync — keep skill content platform-neutral (say "agent session", not "Claude Code session").
@@ -138,6 +139,19 @@ Worth knowing before you write the entry:
 - `npx skills add wso2/agent-skills` will not find the plugin: the skills CLI discovers only
   `SKILL.md` files present in the repo it is pointed at. Name the upstream repo in the README so
   those users can install it directly.
+
+## Evaluating Skills
+
+Each skill carries a promptfoo eval suite under `evals/` that runs the skill the
+way it actually runs in production (the agent SDK discovers it from a fixture
+workspace) and asserts on both **triggering** and **task quality**. Scaffold one:
+
+```bash
+node tools/scaffold-eval.js <plugin-name> <skill-name>
+```
+
+Then fill in the starter tests and run promptfoo. The full guide — what to test,
+how to run, providers/auth, and gotchas — is in [EVALS.md](./EVALS.md).
 
 ## Local Development
 
