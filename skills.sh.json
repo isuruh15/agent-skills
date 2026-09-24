@@ -11,7 +11,7 @@
       "skills": ["manage-agent"]
     },
     {
-      "title": "Migrations",
+      "title": "Healthcare",
       "description": "Skills for migrating Mirth Connect integrations to Ballerina.",
       "skills": ["mirth-to-ballerina"]
     }

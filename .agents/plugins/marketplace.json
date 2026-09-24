@@ -29,10 +29,10 @@
       "category": "Development"
     },
     {
-      "name": "migrations",
+      "name": "healthcare",
       "source": {
         "source": "local",
-        "path": "./plugins/migrations"
+        "path": "./plugins/healthcare"
       },
       "policy": {
         "installation": "AVAILABLE",

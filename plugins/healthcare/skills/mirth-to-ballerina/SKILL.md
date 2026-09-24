@@ -1,6 +1,6 @@
 ---
 name: mirth-to-ballerina
-description: Migrates a Mirth Connect channel XML to a compilable Ballerina project built on ballerina/workflow (Temporal-backed durable workflow orchestration) instead of xlibb/pipeline. Each Mirth destination connector becomes a separate, individually durable @workflow:Activity invoked sequentially via ctx->callActivity, always with a human-review retry policy, with non-critical destinations skipped on failure (graceful completion) rather than failing the whole run. Every project uses two standard error types, ConnectionError and ExecutionError, and source connectors never surface a workflow error to the caller — they always acknowledge receipt and log failures. Also generates a matching test scenario using ballerina/test and the module's IN_MEMORY mode. Use this skill whenever the user - Shares a Mirth Connect channel.xml file or snippet and wants a Ballerina project built on the durable workflow library rather than a pipeline library - Asks for a workflow-based (Temporal-backed) Ballerina migration of a Mirth channel - Wants destination sends modeled as durable, individually-retryable, skippable, human-reviewable activities instead of a pipeline destination list - Needs a generated Ballerina project plus a runnable test for a Mirth migration
+description: Migrates a Mirth Connect channel XML to a compilable Ballerina project built on ballerina/workflow (Temporal-backed durable orchestration), not xlibb/pipeline. Each destination connector becomes a separate, individually durable @workflow:Activity invoked via ctx->callActivity, always with a human-review retry policy; non-critical destinations are skipped on failure instead of failing the whole run. Every project uses two standard error types, ConnectionError and ExecutionError, and source connectors always acknowledge receipt and log failures rather than surfacing errors to the caller. Also generates a matching test scenario using ballerina/test and IN_MEMORY mode. Use whenever the user shares a Mirth channel.xml and wants a workflow-based (Temporal-backed) Ballerina migration, wants destinations modeled as durable, retryable, skippable, human-reviewable activities instead of a pipeline list, or needs a generated project plus a runnable test for a Mirth migration.
 ---
 
 # Mirth Connect → Ballerina (`ballerina/workflow`) Migration Skill
@@ -93,26 +93,8 @@ public type ExecutionError distinct error;
 ```
 
 **Usage rule:** every `@workflow:Activity` function that can fail constructs and returns one of
-these two, never a bare `error(...)`:
-
-```ballerina
-@workflow:Activity
-isolated function sendToFhirServer(PatientRecord patient) returns string|ConnectionError|ExecutionError {
-    http:Client|error fhirClient = new (fhirServerUrl);
-    if fhirClient is error {
-        return error ConnectionError("Could not connect to FHIR server", fhirClient, url = fhirServerUrl);
-    }
-    json|error response = fhirClient->/Patient.post(patient);
-    if response is error {
-        return error ExecutionError("FHIR server rejected the request", response, patientId = patient.patientId);
-    }
-    string|error id = response.id;
-    if id is error {
-        return error ExecutionError("FHIR response missing id field", id);
-    }
-    return id;
-}
-```
+these two, never a bare `error(...)` — see the `sendToFhirServer` example in
+`references/activity-examples.md` for the pattern.
 
 Why this matters beyond naming: a reviewer looking at a raised human-review task (Phase 7/12) sees
 the error type and its `detail()` fields as part of the task context, so `ConnectionError` vs.
@@ -192,183 +174,20 @@ Because of this, the listener function signature itself should not include `|err
 type — that's not just a style choice, it's what makes "never return an error" a compile-time
 guarantee rather than a convention someone can accidentally violate.
 
-### MLLP / HL7v2 listener
-
-Same `Hl7Listener`/`Hl7Service` API as any HL7v2 Ballerina integration — the framing and parsing
-are handled for you. Start the workflow, then immediately return (accepting the message);
-separately await the result **without blocking the ack** so a failure gets logged rather than
-silently dropped:
-
-```ballerina
-import ballerina/log;
-import ballerina/workflow;
-import ballerinax/health.hl7v2;
-import ballerinax/health.hl7v23;
-
-configurable int mllpPort = 2575;
-
-listener hl7v2:Hl7Listener mllpListener = new (mllpPort);
-
-service hl7v2:Hl7Service on mllpListener {
-    // No `|error` in the return type — see the convention above. A failure to even start the
-    // workflow is caught and logged here, never returned to the caller.
-    isolated remote function onMessage(hl7v2:Hl7Client caller, hl7v2:Message message) returns error? {
-        // The workflow input must be `anydata` — wrap the parsed message plus any sourceMap-equivalent
-        // metadata into a single input record (see ChannelInput in types.bal).
-        ChannelInput input = {rawMessage: message.toBaOm().toJson()};
-
-        string|error workflowId = workflow:run(processChannelMessage, input);
-        if workflowId is error {
-            log:printError("Failed to start workflow for inbound HL7 message", 'error = workflowId);
-            return; // still ack — see convention above; ballerina's default MLLP ack is sent here
-        }
-        log:printInfo("Started workflow", workflowId = workflowId);
-
-        // This is ordinary service-level code, NOT inside a @workflow:Workflow function, so
-        // `start` is perfectly fine here (unlike inside the workflow function itself — see
-        // Phase 4). Await the result off to the side so the ack above isn't held up by it.
-        _ = start logWorkflowOutcome(workflowId);
-        // Function returns normally here — the MLLP ack is sent regardless of eventual
-        // workflow outcome. A failed workflow has already raised a review task (Phase 7/12);
-        // it does not need a second, synchronous signal back to the sender.
-    }
-}
-
-// Never called from inside workflow code — this observes a workflow from the outside.
-isolated function logWorkflowOutcome(string workflowId) {
-    anydata|error result = workflow:getWorkflowResult(workflowId);
-    if result is error {
-        log:printError("Workflow ended in error", 'error = result, workflowId = workflowId);
-    }
-}
-```
-
-> `hl7v2:Message` is not itself `anydata` in a form `workflow:run()` can accept directly — the
-> workflow input parameter must be a subtype of `anydata` (`WORKFLOW_101`). Convert or wrap it into
-> a plain record/JSON-friendly type in `types.bal` before calling `workflow:run()`. Re-parsing
-> inside the workflow (via an early pure helper, or the first activity if parsing needs external
-> terminology lookups) is the usual pattern — do **not** try to smuggle a non-`anydata` object
-> through as workflow input.
-
-### HTTP source connector
-
-Respond `202 Accepted` immediately after successfully starting the workflow; never return
-`http:Accepted|error` — resolve any startup failure to a logged error and a `500`/`202` you choose
-deliberately, not an unhandled `check` that lets the error escape as-is:
-
-```ballerina
-import ballerina/http;
-import ballerina/log;
-import ballerina/workflow;
-
-service /api/v1 on new http:Listener(httpPort) {
-    resource function post messages(http:Request request) returns http:Accepted {
-        json|error payload = request.getJsonPayload();
-        if payload is error {
-            log:printError("Could not read inbound payload", 'error = payload);
-            return http:ACCEPTED; // malformed input is still acknowledged, never surfaced as an error
-        }
-
-        string|error workflowId = workflow:run(processChannelMessage, {rawMessage: payload});
-        if workflowId is error {
-            log:printError("Failed to start workflow", 'error = workflowId);
-            return http:ACCEPTED;
-        }
-
-        _ = start logWorkflowOutcome(workflowId);
-        return http:ACCEPTED;
-    }
-}
-```
-
-### File Reader source connector
-
-```ballerina
-import ballerina/file;
-import ballerina/io;
-import ballerina/log;
-import ballerina/workflow;
-
-service "fileWatcher" on new file:Listener({path: watchDirectory, recursive: false}) {
-    // No `|error` in the return type, for the same reason as the MLLP and HTTP listeners above.
-    remote function onModify(file:FileEvent event) returns error? {
-        string|error content = io:fileReadString(event.name);
-        if content is error {
-            log:printError("Could not read file", 'error = content, fileName = event.name);
-            return;
-        }
-        // sourceMap equivalent (originalFilename etc.) travels in as input fields, not as
-        // separately-set properties — see Phase 5.
-        ChannelInput input = {rawMessage: content, originalFilename: event.name};
-        string|error workflowId = workflow:run(processChannelMessage, input);
-        if workflowId is error {
-            log:printError("Failed to start workflow for file", 'error = workflowId, fileName = event.name);
-            return;
-        }
-        _ = start logWorkflowOutcome(workflowId);
-    }
-}
-```
-
-In every case: **the listener starts exactly one workflow instance per inbound message, does no
-orchestration itself, and never lets a workflow-side failure become a protocol-level error.** All
-branching, transformation, and destination sends live in `processChannelMessage` (Phase 4
-onward); all failure escalation lives in the human-review policy (Phase 7/12), not in the source
-connector's response.
+See `references/source-connector-examples.md` for the full MLLP, HTTP, and File Reader listener
+code — each one starts exactly one workflow instance per inbound message, then immediately
+acknowledges, awaiting the eventual result off to the side via `start logWorkflowOutcome(...)`
+rather than blocking the ack on it. All branching, transformation, and destination sends live in
+`processChannelMessage` (Phase 4 onward); all failure escalation lives in the human-review policy
+(Phase 7/12), not in the source connector's response.
 
 ---
 
 ## Phase 4: Model the Message Flow as the `@workflow:Workflow` Function
 
-This is the structural heart of the translation. One Mirth channel → one workflow function, with
-this shape:
-
-```ballerina
-import ballerina/workflow;
-
-@workflow:Workflow
-function processChannelMessage(workflow:Context ctx, ChannelInput input) returns ChannelResult|error {
-    // 1. Preprocessor equivalent — pure mutation, plain function call, no callActivity needed.
-    string normalized = normalizeRawMessage(input.rawMessage);
-
-    // 2. Source filter equivalent — plain boolean check, early return drops the message
-    //    (silent drop, matching Mirth's FilterConfig returning false).
-    if !passesSourceFilter(normalized) {
-        return {status: "FILTERED"};
-    }
-
-    // 3. Source transformer equivalent — pure data shaping, plain function call.
-    PatientRecord patient = check extractPatient(normalized);
-
-    // 4. Side-effect / lookup step with external I/O — this DOES need an activity. Every
-    //    callActivity call always carries a human-review retryPolicy (Phase 7) — never
-    //    AutoRetry, never the default NoAutomaticRetry.
-    boolean patientExists = check ctx->callActivity(lookupPatientInDb, {"patientId": patient.patientId},
-            stepId = "lookup_patient_in_db",
-            retryPolicy = {userRoles: "OPS", title: "Patient lookup failed"});
-
-    // 5. Destinations — separate durable activities, called sequentially, each critical or
-    //    non-critical, each with a human-review retryPolicy. See Phase 12 for the full pattern
-    //    with skip-on-failure. Activities return ConnectionError|ExecutionError on failure
-    //    (Phase "Error Types"), never a bare error.
-    string reservationId = check ctx->callActivity(sendToFhirServer, {"patient": patient},
-            stepId = "send_to_fhir",
-            retryPolicy = {userRoles: "MANAGER", title: "Failure sending patient to FHIR server"});
-
-    string|ConnectionError|ExecutionError auditResult = ctx->callActivity(writeAuditLog,
-            {"patientId": patient.patientId}, stepId = "write_audit_log",
-            retryPolicy = {userRoles: "OPS", title: "Failure writing audit log"});
-
-    // 6. Postprocessor equivalent — results are already local variables, just assemble the outcome.
-    string[] skipped = [];
-    if auditResult is error {
-        skipped.push("write_audit_log");
-    }
-    return {status: "COMPLETED", reservationId, skippedSteps: skipped};
-}
-```
-
-### Mapping table
+This is the structural heart of the translation. One Mirth channel → one workflow function. See
+`references/workflow-and-script-examples.md` for the full `processChannelMessage` example; the
+mapping table below is what drives the translation decisions.
 
 | Mirth concept | `ballerina/workflow` equivalent |
 |---|---|
@@ -386,17 +205,15 @@ function processChannelMessage(workflow:Context ctx, ChannelInput input) returns
 | Postprocessor Script | Inline code near the end of the workflow function, working off local result variables |
 | Any destination's retry/queue behavior | Not `AutoRetry` — a human-review `retryPolicy` (`ReviewTaskDefinition`), always. See Phase 7/12. |
 
-### Why "pure vs. activity" matters for correctness, not just style
-
-`@workflow:Workflow` functions must be **deterministic** — replay must reach the same decisions
-given the same recorded history. Reading `time:utcNow()`, calling an external endpoint directly,
-or reading mutable module-level state from inside the workflow function are all determinism
-violations; only some of them (`worker`/`fork`/`start`, direct calls to `@workflow:Activity`
-functions) are caught at compile time. Direct HTTP/DB/file calls inside workflow code are **not**
-caught by the compiler and will silently misbehave on recovery — so when in doubt about whether a
-translated Mirth step needs to be an activity, the test is: *does this step touch anything outside
-the current process?* If yes, activity. If it's pure computation over values already in scope,
-plain function.
+**Why "pure vs. activity" matters for correctness, not just style:** `@workflow:Workflow` functions
+must be **deterministic** — replay must reach the same decisions given the same recorded history.
+Reading `time:utcNow()`, calling an external endpoint directly, or reading mutable module-level
+state from inside the workflow function are all determinism violations; only some of them
+(`worker`/`fork`/`start`, direct calls to `@workflow:Activity` functions) are caught at compile
+time. Direct HTTP/DB/file calls inside workflow code are **not** caught by the compiler and will
+silently misbehave on recovery — so when in doubt about whether a translated Mirth step needs to be
+an activity, the test is: *does this step touch anything outside the current process?* If yes,
+activity. If it's pure computation over values already in scope, plain function.
 
 ---
 
@@ -421,40 +238,10 @@ in pipeline-based translations.
 stricter.** In a `@workflow:Workflow` function, reading or writing mutable module-level state
 directly is a determinism violation the compiler does **not** catch (see Phase 4). So unlike a
 pipeline translation where `msgCtx`-adjacent module state can be touched inline, here the get/set
-must go through an `@workflow:Activity` so the engine records the interaction:
-
-```ballerina
-// TODO: globalChannelMap translated to a module-level isolated map, accessed ONLY via activities
-// (never read/written directly inside @workflow:Workflow code — that's an undetected determinism
-// violation in this library). Caveats vs Mirth:
-// 1. Reset on process restart — values are not persisted across deployments.
-// 2. Not shared across multiple worker instances — use Redis or a DB table if horizontal
-//    scaling or restart-survival of this state is required.
-// 3. Mirth's globalChannelMap is a ConcurrentHashMap and does not allow null values —
-//    maintain this invariant by never storing () here.
-isolated map<anydata> globalChannelState = {};
-
-@workflow:Activity
-isolated function readGlobalChannelState(string key) returns anydata|error {
-    lock {
-        return globalChannelState[key];
-    }
-}
-
-@workflow:Activity
-isolated function writeGlobalChannelState(string key, anydata value) returns error? {
-    lock {
-        globalChannelState[key] = value;
-    }
-}
-```
-
-These two are an exception to the `ConnectionError`/`ExecutionError` typing convention (Error
-Types section, above) — a `lock{}`-guarded in-memory map read/write doesn't fail in a way that's
-meaningfully "connection" or "execution," so plain `anydata|error`/`error?` is fine here. They
-still carry a human-review `retryPolicy` when called via `ctx->callActivity()`, per the project
-convention in Phase 7 — even an in-memory operation gets the same treatment, since the convention
-is "every activity," not "every activity that talks to a network."
+must go through an `@workflow:Activity` so the engine records the interaction — see
+`references/activity-examples.md` for the full pattern (a `lock{}`-guarded module-level map behind
+`readGlobalChannelState`/`writeGlobalChannelState` activities), including the restart/scaling
+caveats and why these two are an exception to the `ConnectionError`/`ExecutionError` typing rule.
 
 **`sourceMap` variables injected by specific connectors:**
 
@@ -469,135 +256,34 @@ is "every activity," not "every activity that talks to a network."
 
 ## Phase 6: Channel-Level Scripts
 
-### Deploy Script → module `init()`
+| Mirth script | Ballerina equivalent |
+|---|---|
+| Deploy Script | Module `init()` in `service.bal` — runs once at process startup |
+| Undeploy Script | A cleanup function invoked from a graceful-stop handler (no direct Ballerina hook) |
+| Preprocessor Script (pure) | Plain function called at the top of the workflow function |
+| Postprocessor Script | Inline code near the end of the workflow function, reading the local result variables already in scope |
 
-Same as any Ballerina service — runs once at process startup, independent of any single workflow
-instance:
-
-```ballerina
-// In service.bal — module init() runs once at process startup, equivalent to Mirth's Deploy Script.
-// Original Deploy Script: loaded patient lookup cache from DB into globalChannelMap.
-function init() returns error? {
-    // TODO: implement — see original Deploy Script in <deployScript> element
-    // Original used: DatabaseConnectionFactory.getConnection('mpi_db') to pre-load cache
-    log:printInfo("Channel initialized");
-}
-```
-
-### Undeploy Script → graceful stop / cleanup function
-
-```ballerina
-// Ballerina has no direct undeploy hook. Implement cleanup in a function invoked from a graceful
-// stop handler, or at explicit program termination.
-// TODO: implement cleanup — see original Undeploy Script in <undeployScript> element
-isolated function cleanupResources() returns error? {
-    // e.g. close sql:Client connections, flush caches
-}
-```
-
-### Preprocessor Script → plain function, or first activity if it does I/O
-
-```ballerina
-// Translates Mirth Preprocessor Script — mutates raw message string before filtering.
-// Original: stripped BOM characters and normalized line endings before HL7 parsing.
-// Pure string manipulation — no callActivity needed, called directly from the workflow function.
-isolated function normalizeRawMessage(json rawMessage) returns string {
-    // TODO: implement — see original <preprocessorScript> element
-    // Original used: message.replace('\uFEFF', '').replace('\r\n', '\r')
-    return rawMessage.toString(); // placeholder
-}
-```
-
-### Postprocessor Script → inline code near the end of the workflow function
-
-Because destination results are already local variables (Phase 4/5), there is no separate
-`responseMap` lookup step — just read the variables you already have:
-
-```ballerina
-@workflow:Workflow
-function processChannelMessage(workflow:Context ctx, ChannelInput input) returns ChannelResult|error {
-    // ... filters, transforms, destinations as above ...
-
-    // Translates Mirth Postprocessor Script — assembles final response to originating system.
-    // Original: checked ACK code from HL7 destination response; re-queued on AE, sent AA on success.
-    // TODO: implement — see original <postprocessorScript> element
-    // responseMap.get('dest1')  →  the local variable holding dest1's callActivity result, above
-    return {status: "COMPLETED", reservationId, skippedSteps: skipped};
-}
-```
-
-If the postprocessor needs to send something back to the *source* connector (e.g. a custom HL7
-ACK), that logic lives back at the call site in `service.bal`, using
-`workflow:getWorkflowResult()`'s return value — see the MLLP example in Phase 3.
+See `references/workflow-and-script-examples.md` for the full code for all four. If the
+postprocessor needs to send something back to the *source* connector (e.g. a custom HL7 ACK), that
+logic lives back at the call site in `service.bal`, using `workflow:getWorkflowResult()`'s return
+value — see the MLLP example in `references/source-connector-examples.md`.
 
 ---
 
 ## Phase 7: Writing Activities in `activities.bal`
 
-### Filters — plain functions, not activities
+- **Filters** are plain functions, not activities. A filter returning `false` maps to an early
+  `return {status: "FILTERED"};` in the workflow function (Phase 4) — there is no separate "drop
+  silently" mechanism to invoke.
+- **Transformers** are plain functions unless they need external data, in which case the
+  external-lookup part becomes an activity. HL7v2 field access always uses optional chaining —
+  never assume a field exists.
+- **Side-effect / generic-processor steps and destinations** are activities. Every activity that
+  can fail returns `ConnectionError|ExecutionError` (or `T|ConnectionError|ExecutionError` for one
+  that also returns a value on success) rather than a bare `error`, per "Error Types" above.
 
-```ballerina
-isolated function passesSourceFilter(string normalized) returns boolean {
-    // TODO: implement — see original <filter><rule> elements
-    return true;
-}
-```
-
-A filter returning `false` maps to an early `return {status: "FILTERED"};` in the workflow
-function (Phase 4) — there is no separate "drop silently" mechanism to invoke.
-
-### Transformers — plain functions unless they need external data
-
-```ballerina
-isolated function extractPatient(string normalized) returns PatientRecord|error {
-    hl7v23:ADT_A01 adt = check parseAdt(normalized);
-    return {
-        patientId: adt.pid?.pid3?[0]?.cx1 ?: "",
-        lastName:  adt.pid?.pid5?[0]?.xpn1 ?: "",
-        firstName: adt.pid?.pid5?[0]?.xpn2 ?: "",
-        dob:       adt.pid?.pid7?.ts1 ?: ""
-    };
-}
-```
-
-**HL7v2 field access — always use optional chaining, never assume fields exist:**
-
-```
-// Mirth: msg['PID']['PID.3']['PID.3.1']      → adt.pid?.pid3?[0]?.cx1 ?: ""
-// Mirth: msg['MSH']['MSH.4']['MSH.4.1']      → adt.msh.msh4?.hd1 ?: ""
-// Mirth: msg['MSH']['MSH.9']['MSH.9.1']      → adt.msh.msh9?.cm_msg1 ?: ""
-// Mirth: foreach NK1 segment                  → foreach hl7v23:NK1 nk1 in adt.nk1 ?: []
-// Mirth: for each OBX                         → foreach hl7v23:OBX obx in msg.obx ?: []
-```
-
-### Side-effect / generic-processor steps — activities
-
-Every activity that can fail returns `ConnectionError|ExecutionError` (or `T|ConnectionError|ExecutionError`
-for one that also returns a value on success) rather than a bare `error`, per "Error Types —
-Required in Every Project" above:
-
-```ballerina
-@workflow:Activity
-isolated function lookupPatientInDb(string patientId) returns boolean|ConnectionError|ExecutionError {
-    sql:Client|error dbClient = getDbClient();
-    if dbClient is error {
-        return error ConnectionError("Could not connect to patient DB", dbClient);
-    }
-    boolean|error exists = checkPatientExists(dbClient, patientId);
-    if exists is error {
-        return error ExecutionError("Patient lookup query failed", exists, patientId = patientId);
-    }
-    return exists;
-}
-```
-
-Called with a human-review `retryPolicy`, exactly like every other activity in the project:
-
-```ballerina
-boolean|ConnectionError|ExecutionError patientExists = ctx->callActivity(lookupPatientInDb,
-        {"patientId": patient.patientId}, stepId = "lookup_patient_in_db",
-        retryPolicy = {userRoles: "OPS", title: "Patient lookup failed"});
-```
+See `references/activity-examples.md` for the full code for each of these, plus the MLLP sender
+activity (Phase 9).
 
 **Annotation and signature rules that must hold, always:**
 
@@ -614,18 +300,11 @@ boolean|ConnectionError|ExecutionError patientExists = ctx->callActivity(lookupP
 | `stepId` must be a constant string, not computed | `WORKFLOW_161` |
 | Every `ctx->callActivity()` call passes a human-review `retryPolicy` (`{userRoles: ..., title: ...}`) | project convention, not a compiler rule — see below |
 
-**Project convention — human-review `retryPolicy` on every call, no exceptions:**
-
-```ballerina
-string|ConnectionError|ExecutionError actResult = ctx->callActivity(sendToRadiMetrics,
-        {"hl7Message": message}, stepId = "send_to_radimetrics",
-        retryPolicy = {userRoles: "MANAGER", title: "Failure in HL7 Sender"});
-```
-
-`retryPolicy` here is a `ReviewTaskDefinition`, not an `AutoRetry` record. On failure the engine
-raises a review task for the named role(s) instead of retrying automatically or failing outright;
-a person decides whether to rerun the activity, rerun it with edited input, or fail it. Two fields
-matter most when writing one of these for a generated activity:
+**Project convention — human-review `retryPolicy` on every call, no exceptions.** `retryPolicy`
+here is a `ReviewTaskDefinition`, not an `AutoRetry` record. On failure the engine raises a review
+task for the named role(s) instead of retrying automatically or failing outright; a person decides
+whether to rerun the activity, rerun it with edited input, or fail it. Two fields matter most when
+writing one of these for a generated activity:
 
 | Field | What to put there |
 |---|---|
@@ -635,28 +314,6 @@ matter most when writing one of these for a generated activity:
 This applies uniformly: critical and non-critical destinations, side-effect steps, and downstream
 sends all use this same `retryPolicy` shape. What differs between critical and non-critical is
 only whether the workflow function `check`s the result or captures it as `T|error` — see Phase 12.
-
-### Destinations — activities, called sequentially (see Phase 12 for critical/non-critical)
-
-```ballerina
-@workflow:Activity
-isolated function sendToFhirServer(PatientRecord patient) returns string|ConnectionError|ExecutionError {
-    http:Client|error fhirClient = new (fhirServerUrl);
-    if fhirClient is error {
-        return error ConnectionError("Could not connect to FHIR server", fhirClient, url = fhirServerUrl);
-    }
-    json|error response = fhirClient->/Patient.post(patient);
-    if response is error {
-        return error ExecutionError("FHIR server rejected the request", response, patientId = patient.patientId);
-    }
-    // Response transformer equivalent: inspect the response here before returning.
-    string|error id = response.id;
-    if id is error {
-        return error ExecutionError("FHIR response missing id field", id);
-    }
-    return id;
-}
-```
 
 ---
 
@@ -675,41 +332,10 @@ separate queue component.
 
 ## Phase 9: MLLP Sender (TCP Dispatcher) as an Activity
 
-```ballerina
-import ballerinax/health.clients.hl7;
-import ballerinax/health.hl7v2;
-import ballerina/workflow;
-
-configurable string destHost = "downstream.example.com";
-configurable int destPort = 2575;
-
-final hl7:HL7Client hl7SenderClient = check new (destHost, destPort);
-
-// HL7Client handles MLLP framing automatically — do not wrap bytes manually.
-@workflow:Activity
-isolated function sendToDownstream(json messageJson) returns json|ConnectionError|ExecutionError {
-    hl7v2:Message|error msg = hl7v2:parse(messageJson.toString());
-    if msg is error {
-        return error ExecutionError("Could not re-parse HL7 message before send", msg);
-    }
-    hl7v2:Message|hl7v2:HL7Error ack = hl7SenderClient->sendMessage(msg);
-    if ack is hl7v2:HL7Error {
-        // A send/connect failure at the transport level — classify as ConnectionError so a
-        // reviewer knows this is "the endpoint was unreachable," not "the payload was rejected."
-        return error ConnectionError("HL7 send failed", ack, host = destHost, port = destPort);
-    }
-    return ack.toJson();
-}
-```
-
-Called from the workflow function exactly like any other destination activity — always with the
-human-review `retryPolicy`:
-
-```ballerina
-json|ConnectionError|ExecutionError ackResult = ctx->callActivity(sendToDownstream,
-        {"messageJson": normalized}, stepId = "send_hl7_downstream",
-        retryPolicy = {userRoles: "MANAGER", title: "Failure in HL7 Sender"});
-```
+Same activity shape as any other destination (Phase 7), using `health.clients.hl7:HL7Client` —
+which handles MLLP framing automatically, so do not wrap bytes manually. See
+`references/activity-examples.md` for the full `sendToDownstream` activity and its
+`ctx->callActivity()` call site.
 
 ---
 
@@ -756,18 +382,7 @@ database = "mirthdb"
 - `taskQueue` must be unique per deployment — name it after the channel, e.g.
   `ORDER_ADMIT_CHANNEL_QUEUE`, so it doesn't collide with other channels' workers sharing the same
   Temporal cluster/namespace.
-- For database `DbConfig` records, annotate the password field:
-
-```ballerina
-public type DbConfig record {|
-    string host;
-    int port;
-    string user;
-    @sql:SensitiveConfig
-    string password;
-    string database;
-|};
-```
+- For database `DbConfig` records, annotate the password field with `@sql:SensitiveConfig`.
 
 ---
 
@@ -777,8 +392,7 @@ This is the pattern that must be applied to **every** channel this skill migrate
 destination connector, decide critical or non-critical, then translate all destinations as
 **separate durable activities, called sequentially, every one carrying a human-review
 `retryPolicy`**, applying **skip-on-failure to the non-critical ones** once a reviewer has had the
-chance to act (or the review task itself times out / is resolved as "fail it" — see the note on
-review-task resolution below).
+chance to act (or the review task itself times out / is resolved as "fail it").
 
 ### Step 1 — classify each destination
 
@@ -795,253 +409,43 @@ Unlike a project where retry mechanism varies by classification, here classifica
 
 ### Step 2 — define the two error types once, in `types.bal`
 
-```ballerina
-public type ConnectionError distinct error;
-public type ExecutionError distinct error;
-```
-
-(See "Error Types — Required in Every Project" near the top of this file for the full usage rule.)
+See "Error Types — Required in Every Project" near the top of this file for the full usage rule.
 
 ### Step 3 — translate as sequential `ctx->callActivity()` calls, every one with a human-review `retryPolicy`
 
-```ballerina
-@workflow:Workflow
-function processOrder(workflow:Context ctx, OrderInput input) returns OrderResult|error {
-    // CRITICAL destination — check propagates failure, fails the whole workflow. Still uses the
-    // human-review retryPolicy: on failure a reviewer is paged before the workflow is allowed to
-    // fail, rather than failing silently/automatically.
-    string reservationId = check ctx->callActivity(reserveInventory, {
-        "orderId": input.orderId, "item": input.item, "quantity": input.quantity
-    }, stepId = "reserve_inventory",
-       retryPolicy = {userRoles: "OPS", title: "Failure reserving inventory"});
-
-    // CRITICAL destination — depends on the first; still `check`'d, still sequential, still
-    // human-reviewed on failure.
-    string paymentTxnId = check ctx->callActivity(chargePayment, {
-        "orderId": input.orderId, "amount": input.amount
-    }, stepId = "charge_payment",
-       retryPolicy = {userRoles: "MANAGER", title: "Failure charging payment"});
-
-    // NON-CRITICAL destination — captured as T|ConnectionError|ExecutionError. On failure a
-    // reviewer is paged (same retryPolicy shape as the critical steps above); once that review
-    // resolves without a successful rerun, the workflow continues and this step is skipped.
-    string|ConnectionError|ExecutionError emailResult = ctx->callActivity(sendConfirmationEmail, {
-        "email": input.customerEmail, "orderId": input.orderId
-    }, stepId = "send_confirmation_email",
-       retryPolicy = {userRoles: "OPS", title: "Failure sending confirmation email"});
-
-    // NON-CRITICAL destination — same pattern, independent step, independently durable.
-    string|ConnectionError|ExecutionError auditResult = ctx->callActivity(writeAuditLog, {
-        "orderId": input.orderId, "reservationId": reservationId
-    }, stepId = "write_audit_log",
-       retryPolicy = {userRoles: "OPS", title: "Failure writing audit log"});
-
-    string[] skipped = [];
-    if emailResult is error {
-        skipped.push("send_confirmation_email");
-    }
-    if auditResult is error {
-        skipped.push("write_audit_log");
-    }
-
-    return {
-        orderId: input.orderId,
-        status: "COMPLETED",
-        reservationId,
-        paymentTxnId,
-        skippedSteps: skipped
-    };
-}
-```
-
-Notes that make this correct, not just plausible-looking:
-
-- Every `ctx->callActivity()` call gets an explicit, constant `stepId` string that mirrors the
-  Mirth destination's name — this is what shows up in the Temporal Web UI's event history and in
-  the review task, so name it the way you'd want to find it during an incident.
-- Every `ctx->callActivity()` call gets a `retryPolicy = {userRoles: ..., title: ...}` — no
-  exceptions, no `AutoRetry`, no unset (default `NoAutomaticRetry`) `retryPolicy`. This is a fixed
-  project convention (Phase 7), applied to critical and non-critical destinations alike.
-- Critical destinations use `check` — once the raised review task resolves without a successful
-  rerun, the error propagates and fails the workflow run, exactly like Mirth's "Never queue, fail
-  the message," except a human had the chance to intervene first.
-- Non-critical destinations bind the result to a `T|ConnectionError|ExecutionError` variable
-  instead of `check`ing it. Do **not** discard the value with `_` if you intend to report skipped
-  steps — you need the `is error` branch. A no-value non-critical activity (`error?` return) still
-  needs an explicit binding for the type checker to work with:
-  `ConnectionError|ExecutionError? emailResult = ctx->callActivity(...)`, then
-  `if emailResult is error { skipped.push(...); }`.
-- `ChannelResult`/`OrderResult` should carry a `skippedSteps: string[]` (or richer, a
-  `map<string>` of stepId → skip reason, ideally including which error type it was) so the skip
-  outcome is visible to whatever called `workflow:getWorkflowResult()`, not just buried in the
-  Temporal event history and the review task log.
-- Because each `callActivity()` call is individually recorded, a transient crash mid-run does
-  **not** re-send to destinations that already succeeded — recovery resumes from the next
-  un-recorded step. This is the durability payoff for giving up parallel fan-out.
-- **Resolving the review task itself** is a separate concern from this workflow-function code: a
-  person (or an operational tool acting on their behalf) resolves a raised review task through the
-  module's general human-task completion surface (`workflow:completeHumanTask()`, discoverable via
-  `management:listPendingHumanTasks()` — see `ballerina/workflow`'s own human-in-the-loop
-  documentation). The exact decision payload shape for a *review* task specifically (rerun / rerun
-  with edited input / fail) was not spelled out in the reference material this skill was built
-  from — confirm the live module's reference before hardcoding that shape into generated code or
-  tests, rather than guessing at field names.
+See `references/error-handling-example.md` for the full worked example (`processOrder`, with two
+critical and two non-critical destinations) and the notes that make it correct rather than just
+plausible-looking — in particular: every call needs an explicit constant `stepId`; non-critical
+results must be bound (never discarded with `_`) so the `is error` branch can record the skip;
+and resolving a raised review task is a separate concern handled through the module's human-task
+completion surface, whose exact decision-payload shape should be confirmed against the live
+`ballerina/workflow` reference rather than guessed at.
 
 ---
 
 ## Phase 13: Generating a Test Scenario
 
 Every migrated project from this skill includes a runnable test that exercises the workflow
-end-to-end without needing a real Temporal server, plus one test that specifically proves the
-skip-on-failure behavior for a non-critical destination.
+end-to-end without needing a real Temporal server, plus tests that specifically prove: the
+skip-on-failure behavior for a non-critical destination, that a critical-destination failure
+propagates and fails the workflow, and that the source connector always acknowledges even when the
+underlying workflow fails. See `references/test-scenario-examples.md` for:
 
-### `tests/Config.toml` — force in-memory mode for tests
+- `tests/Config.toml`, forcing `mode = "IN_MEMORY"` so tests run fast and in-process.
+- The happy-path test, the skip-on-failure and critical-failure tests, and the
+  always-acks-at-the-source test.
 
-Ballerina automatically layers a `tests/Config.toml` on top of the root `Config.toml` when running
-`bal test`. Use it to switch the workflow engine into `IN_MEMORY` mode so tests run fast, in-process,
-and without any external Temporal server:
+**Two things every generated test suite must get right, not just plausibly resemble:**
 
-```toml
-[ballerina.workflow]
-mode = "IN_MEMORY"
-
-# Point any external clients used by activities at local/mock endpoints for the test run.
-fhirServerUrl = "http://localhost:9090/fhir/r4"
-destHost = "localhost"
-destPort = 8776
-```
-
-### `tests/resources/sample-input.json` (or `.hl7`) — one representative message
-
-Keep this small and representative rather than exhaustive — a single ADT^A01 (or the channel's
-actual primary message type) with the fields the workflow's filters/transformers actually branch
-on.
-
-### `tests/workflow_test.bal` — happy path
-
-```ballerina
-import ballerina/test;
-import ballerina/workflow;
-import ballerina/io;
-
-@test:Config {}
-function testProcessOrderHappyPath() returns error? {
-    string sampleInput = check io:fileReadString("tests/resources/sample-input.json");
-    OrderInput input = {orderId: "ORD-TEST-001", item: "widget", quantity: 1,
-        amount: 19.99, customerEmail: "test@example.com"};
-
-    string workflowId = check workflow:run(processOrder, input);
-
-    anydata result = check workflow:getWorkflowResult(workflowId);
-    OrderResult orderResult = check result.cloneWithType();
-
-    test:assertEquals(orderResult.status, "COMPLETED");
-    test:assertEquals(orderResult.orderId, "ORD-TEST-001");
-    test:assertEquals(orderResult.skippedSteps.length(), 0);
-}
-```
-
-### `tests/workflow_test.bal` — skip-on-failure scenario, with the human-review step in the loop
-
-Because every destination in this design uses a human-review `retryPolicy` (Phase 7/12), a failing
-activity does not resolve itself the moment the call fails — it raises a review task and the
-workflow durably pauses at that step until the task is resolved. So a test proving the
-skip-on-failure path has one more beat than a plain retry-based test would: drive the underlying
-call to fail, then resolve the resulting review task as "fail it" (via the module's human-task
-completion surface — see the caveat in Phase 12 about confirming the exact decision payload shape
-against the live module reference before hardcoding it here), and only then assert on the
-completed, skipped outcome:
-
-```ballerina
-@test:Config {}
-function testNonCriticalDestinationSkippedOnFailure() returns error? {
-    // tests/Config.toml points destHost/destPort (used by sendConfirmationEmail's underlying
-    // client) at an address nothing is listening on, so this destination will fail every attempt
-    // and raise a review task instead of resolving on its own.
-    OrderInput input = {orderId: "ORD-TEST-002", item: "widget", quantity: 1,
-        amount: 9.99, customerEmail: "unreachable@example.invalid"};
-
-    string workflowId = check workflow:run(processOrder, input);
-
-    // TODO: resolve the raised review task for the "send_confirmation_email" step as "fail it,"
-    // using the module's human-task completion surface (workflow:completeHumanTask() /
-    // management:listPendingHumanTasks()) — confirm the review-task decision payload shape
-    // against the live ballerina/workflow reference before filling this in; it was not part of
-    // the material this skill was authored from.
-
-    anydata result = check workflow:getWorkflowResult(workflowId);
-    OrderResult orderResult = check result.cloneWithType();
-
-    // The workflow still completes — the failing destination is non-critical, and the raised
-    // review task was resolved as "fail it" above rather than left pending.
-    test:assertEquals(orderResult.status, "COMPLETED");
-    test:assertTrue(orderResult.skippedSteps.indexOf("send_confirmation_email") is int);
-}
-
-@test:Config {}
-function testCriticalDestinationFailurePropagates() returns error? {
-    // Use an input that the critical activity (e.g. chargePayment) is written to reject,
-    // to prove that a critical-path failure — once its review task is resolved as "fail it" —
-    // fails the whole workflow rather than being skipped.
-    OrderInput input = {orderId: "ORD-TEST-003", item: "widget", quantity: 1,
-        amount: -1.00, customerEmail: "test@example.com"};
-
-    string workflowId = check workflow:run(processOrder, input);
-
-    // TODO: resolve the raised review task for the "charge_payment" step as "fail it" — see the
-    // same caveat as the skip-on-failure test above.
-
-    anydata|error result = workflow:getWorkflowResult(workflowId);
-
-    test:assertTrue(result is error);
-}
-```
-
-### `tests/workflow_test.bal` — the source connector never surfaces an error
-
-Because Phase 3 requires every listener to always acknowledge receipt regardless of the eventual
-workflow outcome, add a service-level test proving that, even when the workflow underneath fails
-outright, the HTTP/MLLP/file entry point still responds success. For the HTTP source connector:
-
-```ballerina
-import ballerina/http;
-
-@test:Config {}
-function testServiceAlwaysRespondsAcceptedEvenOnWorkflowFailure() returns error? {
-    http:Client testClient = check new ("http://localhost:8090");
-    // A payload built to make the underlying workflow fail on a critical step.
-    json badPayload = {"orderId": "ORD-TEST-004", "amount": -1.00};
-
-    http:Response response = check testClient->post("/api/v1/messages", badPayload);
-
-    // The resource function never returns |error (Phase 3) — this must be 202 regardless of
-    // what happens to the workflow it started.
-    test:assertEquals(response.statusCode, 202);
-}
-```
-
-Notes:
-
-- There is no documented activity-mocking facility in `ballerina/workflow` at the time of writing
-  — these tests exercise the real activity functions end-to-end against `IN_MEMORY` mode, driving
-  failure via test-environment configuration (bad endpoint, invalid input) rather than swapping in
-  a mock. If the project already uses Ballerina's general-purpose `test:mock()` / module-level
-  function mocking for its activities, that still works the normal Ballerina way — it's orthogonal
-  to the workflow engine — but don't invent a workflow-specific mocking API that isn't documented.
-- Keep the failing-destination test's failure *deterministic* (an address nothing listens on, not
-  a flaky network call) — a flaky test here is worse than no test, since it undermines confidence
-  in the skip-on-failure guarantee it's meant to demonstrate.
-- Every review-task-resolution `TODO` above is a real gap to close, not decorative — a test that
-  calls `workflow:getWorkflowResult()` right after `workflow:run()` without resolving the pending
-  review task will hang (or time out per the test framework's own timeout) rather than reach the
-  assertion, precisely because the human-review policy is now mandatory on every activity. Do not
-  ship a generated test suite with this TODO unresolved and call it passing.
-- For a channel with a durable-sleep or external-data-wait step (timers, human-in-the-loop
-  approvals) *in addition to* the mandatory review-task-on-failure behavior, `IN_MEMORY` mode still
-  checkpoints correctly but the test needs to send the relevant external data via
-  `workflow:sendData()` (or resolve the relevant human task) before asserting — call this out as a
-  `// TODO` in the generated test if the channel has such a step, rather than guessing at a safe
-  wait duration.
+- Because every activity uses a human-review `retryPolicy` (Phase 7/12), a test that drives a
+  destination to fail and then immediately calls `workflow:getWorkflowResult()` **will hang**
+  unless it first resolves the review task the failure raised. Every such `// TODO: resolve the
+  review task` in the reference examples is a real gap the generated test must close, not
+  decoration — do not ship a test suite with it unresolved and call it passing.
+- There is no documented activity-mocking facility in `ballerina/workflow` — drive failure through
+  test-environment configuration (an address nothing listens on, an invalid input), not a
+  fabricated mocking API, and keep it deterministic so the skip-on-failure guarantee it demonstrates
+  is trustworthy.
 
 ---
 
