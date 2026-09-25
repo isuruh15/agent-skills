@@ -1,6 +1,7 @@
-# migrations Plugin
+# healthcare Plugin
 
-Agent skills for migrating third-party integrations to WSO2 technologies.
+Agent skills for writing services and integrations in Ballerina for healthcare applications,
+including HL7v2 and FHIR support.
 
 ## Skills
 
@@ -24,4 +25,4 @@ See the [installation instructions](../../README.md#installation) in the main RE
 > Here's a Mirth channel with a JavaScript transformer that looks up a patient in a DB — translate it to Ballerina.
 ```
 
-The skill parses the channel's source connector, destinations, filters, transformers, and lifecycle scripts, then produces a complete Ballerina project (`Ballerina.toml`, `Config.toml`, `types.bal`, `handlers.bal`, `service.bal`) using the `xlibb/pipeline` module to model the message flow. JavaScript logic that can't be translated directly is emitted as a typed stub with a full contract comment describing exactly what to implement, so nothing is silently dropped.
+The skill parses the channel's source connector, destinations, filters, transformers, and lifecycle scripts, then produces a complete Ballerina project (`Ballerina.toml`, `Config.toml`, `types.bal`, `activities.bal`, `workflow.bal`, `service.bal`) using the `ballerina/workflow` module (Temporal-backed durable orchestration) to model the message flow. JavaScript logic that can't be translated directly is emitted as a typed stub with a full contract comment describing exactly what to implement, so nothing is silently dropped.

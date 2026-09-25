@@ -12,7 +12,7 @@
     },
     {
       "title": "Healthcare",
-      "description": "Skills for migrating Mirth Connect integrations to Ballerina.",
+      "description": "Skills for building healthcare integrations in Ballerina, including HL7v2 and FHIR support.",
       "skills": ["mirth-to-ballerina"]
     }
   ]

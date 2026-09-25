@@ -1,7 +1,7 @@
 {
   "name": "healthcare",
   "version": "0.1.0",
-  "description": "WSO2 Healthcare skills: migrate Mirth Connect channel XML to compilable Ballerina integration projects.",
+  "description": "WSO2 Healthcare skills: write services and integrations in Ballerina for healthcare applications, including HL7v2 and FHIR support.",
   "author": {
     "name": "WSO2",
     "url": "https://wso2.com"
