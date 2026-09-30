@@ -201,3 +201,40 @@ via `ctx->callActivity()`, per the project convention in Phase 7 — even an in-
 the same treatment, since the convention is "every activity," not "every activity that talks to a
 network."
 ```
+
+---
+
+## Annotation and signature rules that must hold, always
+
+Consulted from Phase 7 of `SKILL.md`. Each violation's compiler error code is given so a failed
+build maps straight back to the rule it broke.
+
+| Rule | Error if violated |
+|---|---|
+| Activity parameters must all be subtypes of `anydata` | `WORKFLOW_103` |
+| Activity return type must be a subtype of `anydata` or `error` | `WORKFLOW_104` |
+| `ctx->callActivity()` target must be an `@workflow:Activity`-annotated function | `WORKFLOW_107` |
+| Never call an `@workflow:Activity` function directly — always through `ctx->callActivity()` | `WORKFLOW_108` |
+| `callActivity`'s args map must supply every required parameter | `WORKFLOW_109` |
+| `callActivity`'s args map must not include parameters the activity doesn't have | `WORKFLOW_110` |
+| Activities with rest parameters are not supported by `callActivity` | `WORKFLOW_111` |
+| A no-value (`error?`) activity result must still be bound to something (even `() _ =`) so the type can be inferred | compile error — see Phase 12 |
+| `stepId` must be a constant string, not computed | `WORKFLOW_161` |
+| Every `ctx->callActivity()` call passes a human-review `retryPolicy` (`{userRoles: ..., title: ...}`) | project convention, not a compiler rule — see below |
+
+## Writing the human-review `retryPolicy`
+
+`retryPolicy` is a `ReviewTaskDefinition`, never an `AutoRetry` record and never the default
+`NoAutomaticRetry`. On failure the engine raises a review task for the named role instead of
+retrying automatically or failing outright; a person decides whether to rerun the activity, rerun
+it with edited input, or fail it. Two fields matter most:
+
+| Field | What to put there |
+|---|---|
+| `userRoles` | The role that should see and act on this failure — carry over from context if the original Mirth channel had an operational owner/team, otherwise a sensible default such as `"OPS"` for infrastructure-facing steps and `"MANAGER"` for business-facing destination sends |
+| `title` | Short, specific, and namable in an incident — "Failure in HL7 Sender", "Failure sending patient to FHIR server" — not a generic "Activity failed" |
+
+This applies uniformly: critical and non-critical destinations, side-effect steps, and downstream
+sends all use this same `retryPolicy` shape. What differs between critical and non-critical is only
+whether the workflow function `check`s the result or captures it as `T|error` — see Phase 12 and
+`references/retry-and-skip-mapping.md`.

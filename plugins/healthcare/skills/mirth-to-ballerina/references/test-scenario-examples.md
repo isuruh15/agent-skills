@@ -1,9 +1,19 @@
 # Test Scenario Examples (workflow-based)
 
-Consulted during Phase 13 (Generating a Test Scenario) of `SKILL.md`. Every migrated project from
+Consulted during Phase 13.1 (the in-process test suite) of `SKILL.md`. Every migrated project from
 this skill includes a runnable test that exercises the workflow end-to-end without needing a real
 Temporal server, plus one test that specifically proves the skip-on-failure behavior for a
 non-critical destination.
+
+**This suite is where all failure behavior is verified, and it is the only place it is verified.**
+The mock-based run in Phase 13.2–13.3 (see `references/mock-service-examples.md`) deliberately
+injects no errors at all — every mock accepts, and its manifest contains success paths only. So the
+skip-on-failure test, the critical-failure test and the always-acknowledge test below are not
+duplicated anywhere else; dropping one leaves that guarantee unverified. The two runs also answer
+different questions: these tests call `workflow:run()` in-process and prove the workflow function's
+own logic, while the mock run starts the real listeners and clients and proves the wiring — protocol
+framing, config resolution, whether a message survives the whole path. Green tests with a red
+verification run is a normal and informative outcome: the logic is right and the wiring is not.
 
 ## `tests/Config.toml` — force in-memory mode for tests
 

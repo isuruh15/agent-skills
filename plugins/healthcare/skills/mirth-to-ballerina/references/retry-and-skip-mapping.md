@@ -82,3 +82,19 @@ task specifically (rerun / rerun with edited input / fail) is not detailed in th
 material this skill was authored from; confirm it against the live module's reference before
 wiring it into generated `service.bal` management endpoints or `tests/workflow_test.bal` test
 cases, rather than guessing at field names.
+
+## Classifying a destination as critical or non-critical
+
+Consulted from Phase 12, Step 1 of `SKILL.md`. Classification decides only whether the workflow
+function `check`s the activity result or captures it as `T|error`; the `retryPolicy` shape is the
+same either way.
+
+| Mirth signal | Classification |
+|---|---|
+| Queue mode "Never" and the channel has no fallback path if this destination fails | Critical |
+| The channel's primary business outcome depends on this destination succeeding (e.g. the record store, the primary downstream system) | Critical |
+| Side-channel effects — email notification, audit log, analytics/metrics export, a "nice to have" secondary copy | Non-critical |
+| Queue mode "On Failure" with a bounded retry count, where the channel keeps going regardless of outcome | Non-critical |
+
+When the signals conflict, classify by business consequence rather than by queue mode, and record
+the reasoning in Migration Notes §2 so a reviewer can challenge the judgment if it was wrong.

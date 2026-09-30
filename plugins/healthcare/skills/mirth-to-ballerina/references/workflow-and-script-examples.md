@@ -119,3 +119,58 @@ If the postprocessor needs to send something back to the *source* connector (e.g
 ACK), that logic lives back at the call site in `service.bal`, using
 `workflow:getWorkflowResult()`'s return value — see the MLLP example in
 `references/source-connector-examples.md`.
+
+---
+
+## Mirth concept → `ballerina/workflow` equivalent
+
+Consulted from Phase 4 of `SKILL.md`. This is the lookup that drives the translation decisions; the
+`processChannelMessage` example above shows the result assembled into one workflow function.
+
+| Mirth concept | `ballerina/workflow` equivalent |
+|---|---|
+| Source connector | Listener that calls `workflow:run(processChannelMessage, input)` (Phase 3) |
+| Preprocessor Script (pure) | Plain function, called directly at the top of the workflow function |
+| Preprocessor Script (does I/O) | `@workflow:Activity`, called first via `ctx->callActivity()` |
+| Source filter rules | Plain `boolean`-returning function; workflow function does `if !passes { return ...; }` |
+| Source transformer steps (pure) | Plain function returning the shaped record |
+| Source transformer steps (external lookup) | `@workflow:Activity` |
+| Side-effect steps (DB lookup, log) | `@workflow:Activity`, `check`'d if critical or captured as `T\|ConnectionError\|ExecutionError` if not — always with a human-review `retryPolicy` |
+| Destination connector | `@workflow:Activity`, invoked sequentially — see Phase 12 |
+| Multiple destinations | Sequential `ctx->callActivity()` calls, **not** parallel |
+| Destination filter | Plain boolean check before the corresponding `callActivity` call |
+| Response Transformer | Inline code immediately after that destination's `callActivity` call, using its return value |
+| Postprocessor Script | Inline code near the end of the workflow function, working off local result variables |
+| Any destination's retry/queue behavior | Not `AutoRetry` — a human-review `retryPolicy` (`ReviewTaskDefinition`), always. See Phase 7/12. |
+
+---
+
+## Mirth variable maps → Ballerina
+
+Consulted from Phase 5 of `SKILL.md`. Because the whole channel is one workflow function
+invocation rather than a pipeline object threading a `MessageContext` through separate processor
+calls, most of Mirth's variable maps collapse into ordinary local variables.
+
+| Mirth map | JS variable | Scope | `ballerina/workflow` equivalent |
+|---|---|---|---|
+| **Connector Map** | `connectorMap` / `$co` | Current message, current connector only | Local variable inside the relevant activity function |
+| **Channel Map** | `channelMap` / `$c` | Current message, shared across destinations | Local variable in the workflow function, passed as an argument to whichever activity needs it |
+| **Source Map** | `sourceMap` / `$s` | Current message, read-only, injected by source | Fields on the `ChannelInput` record passed to `workflow:run()` |
+| **Response Map** | `responseMap` / `$r` | Current message, destination responses | The return value of each `ctx->callActivity()` call, held in a local variable |
+| **Global Channel Map** | `globalChannelMap` / `$gc` | All messages in this channel, in-memory only | Must be read/written via an activity — see the caveat in Phase 5 |
+| **Global Map** | `globalMap` / `$g` | All messages, all channels, in-memory only | Same as above |
+| **Configuration Map** | `configurationMap` / `$cfg` | Read-only server config | `configurable` Ballerina variables in `Config.toml` |
+
+For the `globalChannelMap`/`globalMap` pattern — a `lock{}`-guarded module-level map behind
+`readGlobalChannelState`/`writeGlobalChannelState` activities, with its restart/scaling caveats and
+why these two are an exception to the `ConnectionError`/`ExecutionError` typing rule — see
+`references/activity-examples.md`.
+
+### `sourceMap` variables injected by specific connectors
+
+| Mirth source connector | Automatic sourceMap keys | Ballerina approach |
+|---|---|---|
+| File Reader | `originalFilename`, `fileDirectory`, `fileSize`, `fileLastModified` | Fields on `ChannelInput` (Phase 3) |
+| HTTP Listener | `remoteAddress`, `localAddress`, HTTP headers as `http.*` | Extract from `http:Request` before calling `workflow:run()`, pass as `ChannelInput` fields |
+| Database Reader | Column names from the query result | Fields on `ChannelInput` |
+| Channel Writer (upstream) | Any variables injected by upstream channel | Document as a TODO — requires tracing the upstream channel |
