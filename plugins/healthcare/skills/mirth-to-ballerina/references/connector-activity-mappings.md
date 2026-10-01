@@ -1,6 +1,13 @@
 # Connector & Dependency Mappings (workflow-based)
 
-Consulted during Phase 1 (Analyze) and Phase 2 (Build the Ballerina.toml) of `SKILL.md`.
+Consulted during Phase 1 (Analyze), Phase 1B (Mocks and Scenarios) and Phase 2 (Build the
+Ballerina.toml) of `SKILL.md`.
+
+The connector table below also drives Phase 1B: every row that is a **source** needs a mock driver
+that speaks its protocol into the real listener, and every row that is a **destination** needs a
+stub that speaks its protocol back and accepts the message. Those mocks always succeed — the
+verification run covers functional behavior, and failure handling is covered by the Phase 13.1 test
+suite. See `references/mock-service-examples.md` for the mock per connector type.
 
 Same connector classes as any Mirth migration; the difference from a pipeline-based translation is
 in the last column, where the Mirth destination becomes an `@workflow:Activity` rather than a

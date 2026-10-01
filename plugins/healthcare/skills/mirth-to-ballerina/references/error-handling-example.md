@@ -86,3 +86,38 @@ function processOrder(workflow:Context ctx, OrderInput input) returns OrderResul
   with edited input / fail) was not spelled out in the reference material this skill was built
   from — confirm the live module's reference before hardcoding that shape into generated code or
   tests, rather than guessing at field names.
+
+---
+
+## The two error types — declarations and usage
+
+Consulted from "Error Types — Required in Every Project" in `SKILL.md`. Every project declares
+exactly these two in `types.bal` and no others:
+
+```ballerina
+# types.bal
+
+// Raised when an activity cannot reach the external system at all — connection refused,
+// DNS failure, timeout establishing the connection, TLS handshake failure, host unreachable.
+public type ConnectionError distinct error;
+
+// Raised when the external system was reached but the interaction itself failed or was
+// rejected — a non-2xx HTTP response, an HL7 application-error (AE) NACK, a DB constraint
+// violation, a validation failure on the payload, an unexpected/malformed response body.
+public type ExecutionError distinct error;
+```
+
+**Usage rule:** every `@workflow:Activity` function that can fail constructs and returns one of
+these two, never a bare `error(...)` — see `references/activity-examples.md` for the pattern.
+
+Why this matters beyond naming: a reviewer looking at a raised human-review task (Phase 7/12) sees
+the error type and its `detail()` fields as part of the task context, so `ConnectionError` vs.
+`ExecutionError` is the first thing that tells them whether "retry once the network's back" or
+"the payload itself needs a human decision" is the right call. Keep the distinction meaningful —
+don't default everything to `ExecutionError` for convenience.
+
+`ctx->callActivity()`'s inferred result type follows whatever the activity declares, so workflow
+code binds to the union directly, e.g.
+`string|ConnectionError|ExecutionError result = ctx->callActivity(...)`, or narrows with
+`result is ConnectionError` / `result is ExecutionError` when the two need different handling
+before falling through to the shared skip/fail logic in Phase 12.

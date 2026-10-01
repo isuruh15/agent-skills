@@ -1,6 +1,6 @@
 ---
 name: mirth-to-ballerina
-description: Migrates a Mirth Connect channel XML to a compilable Ballerina project built on ballerina/workflow (Temporal-backed durable orchestration), not xlibb/pipeline. Each destination connector becomes a separate, individually durable @workflow:Activity invoked via ctx->callActivity, always with a human-review retry policy; non-critical destinations are skipped on failure instead of failing the whole run. Every project uses two standard error types, ConnectionError and ExecutionError, and source connectors always acknowledge receipt and log failures rather than surfacing errors to the caller. Also generates a matching test scenario using ballerina/test and IN_MEMORY mode. Use whenever the user shares a Mirth channel.xml and wants a workflow-based (Temporal-backed) Ballerina migration, wants destinations modeled as durable, retryable, skippable, human-reviewable activities instead of a pipeline list, or needs a generated project plus a runnable test for a Mirth migration.
+description: Migrates a Mirth Connect channel XML to a compilable Ballerina project built on ballerina/workflow (Temporal-backed durable orchestration), not xlibb/pipeline. Each destination connector becomes a separate, individually durable @workflow:Activity invoked via ctx->callActivity, always with a human-review retry policy; non-critical destinations are skipped on failure instead of failing the whole run. Every project uses two standard error types, ConnectionError and ExecutionError, and source connectors always acknowledge receipt and log failures rather than surfacing errors to the caller. Also generates mock services for every source and destination connector plus a scenario suite derived from the original channel, a matching test scenario using ballerina/test and IN_MEMORY mode, and an end-to-end verification run against those mocks that produces a report on accuracy, latency and token usage with the tested scenarios listed. Use whenever the user shares a Mirth channel.xml and wants a workflow-based (Temporal-backed) Ballerina migration, wants destinations modeled as durable, retryable, skippable, human-reviewable activities instead of a pipeline list, needs a generated project plus a runnable test for a Mirth migration, or wants the migration verified against mock connectors with a metrics report.
 ---
 
 # Mirth Connect → Ballerina (`ballerina/workflow`) Migration Skill
@@ -25,20 +25,18 @@ Ballerina project** that reproduces the channel's behavior using `ballerina/work
 - Mirth's "multiple destinations run in parallel" behavior does **not** carry over as-is. The
   `ballerina/workflow` compiler rejects `worker`, `fork`, and `start` inside a `@workflow:Workflow`
   function (`WORKFLOW_118`/`119`/`120`) because the engine can't track independently-spawned
-  strands in its durable event history. So multiple destinations are translated as **separate,
-  individually durable activities called sequentially**, and each one is explicitly marked
-  critical (`check` — a failure fails the whole workflow) or non-critical (captured as `T|error`
-  and skipped on failure — "graceful completion"). This is a deliberate trade-off: you give up
-  Mirth's wall-clock-parallel destination fan-out in exchange for per-destination durability,
-  retryability, and an audited "which destinations were skipped" outcome. See Phase 12 for exactly
-  how to apply both together.
+  strands in its durable event history. So destinations become **separate, individually durable
+  activities called sequentially**, each marked critical (`check` — failure fails the whole
+  workflow) or non-critical (captured as `T|error` and skipped — "graceful completion"). A
+  deliberate trade-off: wall-clock fan-out is given up for per-destination durability, retryability
+  and an audited record of what was skipped. See Phase 12.
 - **Every `ctx->callActivity()` call in every generated project always passes a human-review
   `retryPolicy`** (a `ReviewTaskDefinition` — `{userRoles: ..., title: ...}`), never `AutoRetry` and
-  never the default `NoAutomaticRetry`. On failure, the engine raises a review task for the named
-  role instead of blind-retrying or immediately failing — a person decides whether to rerun the
-  activity, rerun it with edited input, or fail it. This is a fixed project convention for this
-  skill, applied uniformly regardless of the destination's criticality; see Phase 7 and Phase 12
-  for exactly how it composes with the critical/non-critical (`check` vs. `T|error`) decision.
+  never the default `NoAutomaticRetry`. On failure the engine raises a review task for the named
+  role instead of blind-retrying or failing outright, and a person decides whether to rerun, rerun
+  with edited input, or fail it. A fixed convention, applied uniformly regardless of the
+  destination's criticality; see Phase 7 and Phase 12 for how it composes with the critical /
+  non-critical (`check` vs. `T|error`) decision.
 - **Every generated project defines exactly two error types**, `ConnectionError` and
   `ExecutionError` (see "Error Types — Required in Every Project" below), and every activity that
   can fail constructs one of these two instead of a bare `error(...)`, so failures are
@@ -69,51 +67,44 @@ Ballerina project** that reproduces the channel's behavior using `ballerina/work
 ├── workflow.bal               (the single @workflow:Workflow orchestration function)
 ├── service.bal               (listener wiring — starts workflow instances via workflow:run())
 ├── utils.bal                  (pure helper functions — filters, transforms; only if needed)
-└── tests/
-    ├── Config.toml            (forces mode = "IN_MEMORY" for the test run)
-    ├── workflow_test.bal      (ballerina/test cases)
-    └── resources/
-        └── sample-input.*     (one representative sample message per test case)
+├── tests/
+│   ├── Config.toml            (forces mode = "IN_MEMORY" for the test run)
+│   ├── workflow_test.bal      (ballerina/test cases)
+│   └── resources/
+│       └── sample-input.*     (one representative sample message per test case)
+└── verification/              (Phase 1B; run in Phase 13 — never shipped with the integration)
+    ├── Config.verification.toml  (overrides only — repoints the project at the mocks)
+    ├── mocks/                 (a SEPARATE Ballerina package — its deps never touch the project's)
+    ├── scenarios/             (scenarios.json + one input message per scenario)
+    └── report/                (migration-verification-report.md)
 ```
 
-Only include files that are actually needed. For a simple channel, `types.bal` + `activities.bal`
-+ `workflow.bal` + `service.bal` + `tests/` is enough — skip `utils.bal` if there's nothing pure
-worth separating out.
+Only include files that are actually needed — for a simple channel, `types.bal` + `activities.bal`
++ `workflow.bal` + `service.bal` + `tests/` is enough, and `utils.bal` can be skipped if there is
+nothing pure worth separating out. `verification/` is not optional in the same way: every migration
+produces mocks, scenarios and a report, because that is what turns "it compiles" into "it behaves
+like the channel it replaced."
 
 ---
 
 ## Error Types — Required in Every Project
 
-Every project from this skill defines exactly two `distinct error` types in `types.bal`, and no
-others (plain `error("...")` for anything an activity can fail with is not acceptable):
+Every project defines exactly two `distinct error` types in `types.bal` and no others; a bare
+`error("...")` from anything an activity can fail with is not acceptable:
 
-```ballerina
-# types.bal
+- **`ConnectionError`** — the external system could not be reached at all: connection refused, DNS
+  failure, connect timeout, TLS handshake failure, host unreachable.
+- **`ExecutionError`** — the system was reached and the interaction failed or was rejected: a
+  non-2xx response, an HL7 `AE` NACK, a DB constraint violation, a payload validation failure, a
+  malformed response body.
 
-// Raised when an activity cannot reach the external system at all — connection refused,
-// DNS failure, timeout establishing the connection, TLS handshake failure, host unreachable.
-public type ConnectionError distinct error;
+Every `@workflow:Activity` that can fail returns one of these two. The distinction is what tells a
+reviewer, from the raised review task alone, whether "retry once the network is back" or "the
+payload itself needs a human decision" is the right call — so keep it meaningful rather than
+defaulting everything to `ExecutionError` for convenience.
 
-// Raised when the external system was reached but the interaction itself failed or was
-// rejected — a non-2xx HTTP response, an HL7 application-error (AE) NACK, a DB constraint
-// violation, a validation failure on the payload, an unexpected/malformed response body.
-public type ExecutionError distinct error;
-```
-
-**Usage rule:** every `@workflow:Activity` function that can fail constructs and returns one of
-these two, never a bare `error(...)` — see the `sendToFhirServer` example in
-`references/activity-examples.md` for the pattern.
-
-Why this matters beyond naming: a reviewer looking at a raised human-review task (Phase 7/12) sees
-the error type and its `detail()` fields as part of the task context, so `ConnectionError` vs.
-`ExecutionError` is the first thing that tells them whether "retry once the network's back" or
-"the payload itself needs a human decision" is the right call. Keep the distinction meaningful —
-don't default everything to `ExecutionError` for convenience.
-
-`ctx->callActivity()`'s inferred result type follows whatever the activity declares, so workflow
-code binds to the union directly, e.g. `string|ConnectionError|ExecutionError result = ctx->callActivity(...)`,
-or narrows with `result is ConnectionError` / `result is ExecutionError` when the two need
-different handling before falling through to the shared skip/fail logic in Phase 12.
+See `references/error-handling-example.md` for the declarations, the usage pattern, and how
+workflow code binds or narrows the returned union.
 
 ---
 
@@ -140,6 +131,46 @@ equivalent table and the dependency-by-connector-type table (this replaces the
 
 ---
 
+## Phase 1B: Generate Mock Connectors and the Verification Scenario
+
+Run this immediately after Phase 1 and **before generating any of the migrated project's own
+code**. The ordering is the point: expected outputs must be derived from the *original Mirth
+channel*, not from the Ballerina you are about to write. A scenario authored after the code only
+proves the generated project agrees with itself, which is not a migration check at all.
+
+**Scope — this harness verifies functionality, not failure handling.** Every mock always succeeds.
+No scenario injects a connection failure, a rejected send, or any other error, and none asserts on
+`ConnectionError`/`ExecutionError`, `skippedSteps`, or a raised review task. The question it
+answers is narrow and worth answering on its own: *given a message the original channel would have
+handled, does the migrated integration route it to the right destinations, in the right order,
+carrying the right fields?* Failure behavior — skip-on-failure for non-critical destinations,
+propagation for critical ones, the source's always-acknowledge convention — is proven by the
+in-process test suite in Phase 13.1 and stays a hard requirement there. Keeping the two separate is
+what keeps each readable: a failed functional scenario means the translation is wrong, full stop.
+
+**It relaxes nothing else either.** Mocks are reached purely through configuration overrides
+(Phase 11); if one can only be reached by editing a `.bal` file, that is a hardcoded endpoint to
+fix in the generated project, never to work around here.
+
+What this phase produces: a **mock destination service** per `<destinationConnectors>` entry
+(speaking the real protocol, always accepting, recording every receipt in arrival order); a
+**source driver** per source connector, which injects into the **real** listener, since the
+generated source connector is never mocked — its framing, parsing and config wiring are part of
+what is verified; **`scenarios/scenarios.json`**, holding field-level expected outputs derived
+from the XML plus an `unverifiable` list for anything gated behind a Case B/C stub (Phase 10); and
+**`Config.verification.toml`**, overrides only — mock ports plus `[ballerina.workflow] mode =
+"IN_MEMORY"`, so the run needs no Temporal server.
+
+Because nothing is injected, coverage comes entirely from inputs: every message type, both sides of
+every filter, each conditional path in the transformer, and boundary data. One useful consequence —
+since no activity fails, no review task is ever raised and the run never pauses, so the harness does
+not depend on the review-task decision payload whose shape is still unconfirmed (Phase 12).
+
+See `references/mock-service-examples.md` for the mock, driver and recorder code per connector
+type, the full `scenarios.json` schema, and the mandatory coverage table.
+
+---
+
 ## Phase 2: Build the Ballerina.toml
 
 ```toml
@@ -154,12 +185,10 @@ observabilityIncluded = true
 ```
 
 `ballerina/workflow` requires Ballerina **2201.13.0 or later** — do not emit an older
-`distribution` value.
-
-Add `[dependencies]` per connector type from `references/connector-activity-mappings.md`.
-**Always include `ballerina/workflow`** — this is the one non-negotiable dependency for this
-skill. Do **not** add `xlibb/pipeline`; there is no pipeline object in this design, so nothing in
-the generated project should import it.
+`distribution` value. Add `[dependencies]` per connector type from
+`references/connector-activity-mappings.md`. **Always include `ballerina/workflow`** — the one
+non-negotiable dependency for this skill. Do **not** add `xlibb/pipeline`; there is no pipeline
+object in this design, so nothing in the generated project should import it.
 
 ---
 
@@ -171,47 +200,27 @@ It should not contain any business logic.
 **Required convention for every source connector: never return an error from the
 `resource`/`remote` function, regardless of what `workflow:run()` or
 `workflow:getWorkflowResult()` does.** If starting the workflow fails, or the workflow itself
-eventually fails, log it and still acknowledge receipt at the protocol level. The rationale: the
-workflow is durable — a failure is recorded in its event history and (per the human-review policy
-in Phase 7/12) has already raised a review task for a person to act on. Surfacing that same failure
-a second time as a synchronous protocol error to the sending system gains nothing and, for most
-protocols, just causes the sender to retry a delivery that was already durably received. So the
-listener's job ends at "durably accepted," not "durably processed."
-
-Because of this, the listener function signature itself should not include `|error` in its return
-type — that's not just a style choice, it's what makes "never return an error" a compile-time
-guarantee rather than a convention someone can accidentally violate.
+eventually fails, log it and still acknowledge receipt at the protocol level. The workflow is
+durable — the failure is already in its event history and has already raised a review task (Phase
+7/12) for a person to act on. Surfacing it a second time as a synchronous protocol error gains
+nothing and, for most protocols, just makes the sender retry a delivery that was already durably
+received. The listener's job ends at "durably accepted," not "durably processed." So the listener
+function's signature must not include `|error` in its return type — that is what turns the
+convention into a compile-time guarantee rather than something someone can accidentally violate.
 
 See `references/source-connector-examples.md` for the full MLLP, HTTP, and File Reader listener
-code — each one starts exactly one workflow instance per inbound message, then immediately
-acknowledges, awaiting the eventual result off to the side via `start logWorkflowOutcome(...)`
-rather than blocking the ack on it. All branching, transformation, and destination sends live in
-`processChannelMessage` (Phase 4 onward); all failure escalation lives in the human-review policy
-(Phase 7/12), not in the source connector's response.
+code — each starts exactly one workflow instance per inbound message, then acknowledges
+immediately, awaiting the eventual result off to the side via `start logWorkflowOutcome(...)`
+rather than blocking the ack on it.
 
 ---
 
 ## Phase 4: Model the Message Flow as the `@workflow:Workflow` Function
 
 This is the structural heart of the translation. One Mirth channel → one workflow function. See
-`references/workflow-and-script-examples.md` for the full `processChannelMessage` example; the
-mapping table below is what drives the translation decisions.
-
-| Mirth concept | `ballerina/workflow` equivalent |
-|---|---|
-| Source connector | Listener that calls `workflow:run(processChannelMessage, input)` (Phase 3) |
-| Preprocessor Script (pure) | Plain function, called directly at the top of the workflow function |
-| Preprocessor Script (does I/O) | `@workflow:Activity`, called first via `ctx->callActivity()` |
-| Source filter rules | Plain `boolean`-returning function; workflow function does `if !passes { return ...; }` |
-| Source transformer steps (pure) | Plain function returning the shaped record |
-| Source transformer steps (external lookup) | `@workflow:Activity` |
-| Side-effect steps (DB lookup, log) | `@workflow:Activity`, `check`'d if critical or captured as `T\|ConnectionError\|ExecutionError` if not — always with a human-review `retryPolicy` |
-| Destination connector | `@workflow:Activity`, invoked sequentially — see Phase 12 |
-| Multiple destinations | Sequential `ctx->callActivity()` calls, **not** parallel (see stance at top of this file) |
-| Destination filter | Plain boolean check before the corresponding `callActivity` call |
-| Response Transformer | Inline code immediately after that destination's `callActivity` call, using its return value |
-| Postprocessor Script | Inline code near the end of the workflow function, working off local result variables |
-| Any destination's retry/queue behavior | Not `AutoRetry` — a human-review `retryPolicy` (`ReviewTaskDefinition`), always. See Phase 7/12. |
+`references/workflow-and-script-examples.md` for the full `processChannelMessage` example and the
+mapping table of every Mirth concept to its `ballerina/workflow` equivalent — consult that table
+while translating; the decision rule below is what it encodes.
 
 **Why "pure vs. activity" matters for correctness, not just style:** `@workflow:Workflow` functions
 must be **deterministic** — replay must reach the same decisions given the same recorded history.
@@ -230,35 +239,20 @@ activity. If it's pure computation over values already in scope, plain function.
 Because the whole channel is one workflow function invocation rather than a pipeline object
 threading a `MessageContext` through separate processor calls, most of Mirth's variable maps
 collapse into **ordinary local variables** — simpler than the `msgCtx.setProperty()` pattern used
-in pipeline-based translations.
-
-| Mirth map | JS variable | Scope | `ballerina/workflow` equivalent |
-|---|---|---|---|
-| **Connector Map** | `connectorMap` / `$co` | Current message, current connector only | Local variable inside the relevant activity function |
-| **Channel Map** | `channelMap` / `$c` | Current message, shared across destinations | Local variable in the workflow function, passed as an argument to whichever activity needs it |
-| **Source Map** | `sourceMap` / `$s` | Current message, read-only, injected by source | Fields on the `ChannelInput` record passed to `workflow:run()` |
-| **Response Map** | `responseMap` / `$r` | Current message, destination responses | The return value of each `ctx->callActivity()` call, held in a local variable |
-| **Global Channel Map** | `globalChannelMap` / `$gc` | All messages in this channel, in-memory only | See caveat below — must be read/written via an activity |
-| **Global Map** | `globalMap` / `$g` | All messages, all channels, in-memory only | Same as above |
-| **Configuration Map** | `configurationMap` / `$cfg` | Read-only server config | `configurable` Ballerina variables in `Config.toml` |
+in pipeline-based translations. In short: connector map → a local inside the relevant activity;
+channel map → a local in the workflow function, passed as an argument to whichever activity needs
+it; source map → fields on `ChannelInput`; response map → the return value of each
+`ctx->callActivity()`; configuration map → `configurable` variables in `Config.toml`.
 
 **`globalChannelMap` / `globalMap` caveat — different from a pipeline-based translation, and
 stricter.** In a `@workflow:Workflow` function, reading or writing mutable module-level state
 directly is a determinism violation the compiler does **not** catch (see Phase 4). So unlike a
 pipeline translation where `msgCtx`-adjacent module state can be touched inline, here the get/set
-must go through an `@workflow:Activity` so the engine records the interaction — see
-`references/activity-examples.md` for the full pattern (a `lock{}`-guarded module-level map behind
-`readGlobalChannelState`/`writeGlobalChannelState` activities), including the restart/scaling
-caveats and why these two are an exception to the `ConnectionError`/`ExecutionError` typing rule.
+must go through an `@workflow:Activity` so the engine records the interaction.
 
-**`sourceMap` variables injected by specific connectors:**
-
-| Mirth source connector | Automatic sourceMap keys | Ballerina approach |
-|---|---|---|
-| File Reader | `originalFilename`, `fileDirectory`, `fileSize`, `fileLastModified` | Fields on `ChannelInput` (Phase 3) |
-| HTTP Listener | `remoteAddress`, `localAddress`, HTTP headers as `http.*` | Extract from `http:Request` before calling `workflow:run()`, pass as `ChannelInput` fields |
-| Database Reader | Column names from the query result | Fields on `ChannelInput` |
-| Channel Writer (upstream) | Any variables injected by upstream channel | Document as a TODO — requires tracing the upstream channel |
+See `references/workflow-and-script-examples.md` for the full map-by-map table and the
+per-connector `sourceMap` key table, and `references/activity-examples.md` for the `lock{}`-guarded
+global-state activity pattern with its restart/scaling caveats.
 
 ---
 
@@ -291,37 +285,21 @@ value — see the MLLP example in `references/source-connector-examples.md`.
   that also returns a value on success) rather than a bare `error`, per "Error Types" above.
 
 See `references/activity-examples.md` for the full code for each of these, plus the MLLP sender
-activity (Phase 9).
+activity (Phase 9), the table of `WORKFLOW_1xx` signature rules that must hold for every activity
+and `callActivity` call, and field-by-field guidance for writing a `ReviewTaskDefinition`.
 
-**Annotation and signature rules that must hold, always:**
-
-| Rule | Error if violated |
-|---|---|
-| Activity parameters must all be subtypes of `anydata` | `WORKFLOW_103` |
-| Activity return type must be a subtype of `anydata` or `error` | `WORKFLOW_104` |
-| `ctx->callActivity()` target must be an `@workflow:Activity`-annotated function | `WORKFLOW_107` |
-| Never call an `@workflow:Activity` function directly — always through `ctx->callActivity()` | `WORKFLOW_108` |
-| `callActivity`'s args map must supply every required parameter | `WORKFLOW_109` |
-| `callActivity`'s args map must not include parameters the activity doesn't have | `WORKFLOW_110` |
-| Activities with rest parameters are not supported by `callActivity` | `WORKFLOW_111` |
-| A no-value (`error?`) activity result must still be bound to something (even `() _ =`) so the type can be inferred | compile error — see Phase 12 |
-| `stepId` must be a constant string, not computed | `WORKFLOW_161` |
-| Every `ctx->callActivity()` call passes a human-review `retryPolicy` (`{userRoles: ..., title: ...}`) | project convention, not a compiler rule — see below |
-
-**Project convention — human-review `retryPolicy` on every call, no exceptions.** `retryPolicy`
-here is a `ReviewTaskDefinition`, not an `AutoRetry` record. On failure the engine raises a review
-task for the named role(s) instead of retrying automatically or failing outright; a person decides
-whether to rerun the activity, rerun it with edited input, or fail it. Two fields matter most when
-writing one of these for a generated activity:
-
-| Field | What to put there |
-|---|---|
-| `userRoles` | The role that should see and act on this failure — carry over from context if the original Mirth channel had an operational owner/team, otherwise a sensible default such as `"OPS"` for infrastructure-facing steps and `"MANAGER"` for business-facing destination sends |
-| `title` | Short, specific, and namable in an incident — "Failure in HL7 Sender", "Failure sending patient to FHIR server" — not a generic "Activity failed" |
+**Project convention — a human-review `retryPolicy` on every call, no exceptions.** `retryPolicy`
+here is a `ReviewTaskDefinition` (`{userRoles: ..., title: ...}`), not an `AutoRetry` record and
+never the default `NoAutomaticRetry`. On failure the engine raises a review task for the named
+role(s) instead of retrying automatically or failing outright; a person decides whether to rerun
+the activity, rerun it with edited input, or fail it. `userRoles` names the step's operational
+owner — `"OPS"` for infrastructure-facing steps, `"MANAGER"` for business-facing sends, or an owner
+carried over from the Mirth channel. `title` must be specific enough to name in an incident
+("Failure in HL7 Sender"), never a generic "Activity failed".
 
 This applies uniformly: critical and non-critical destinations, side-effect steps, and downstream
-sends all use this same `retryPolicy` shape. What differs between critical and non-critical is
-only whether the workflow function `check`s the result or captures it as `T|error` — see Phase 12.
+sends all use the same `retryPolicy` shape. What differs between critical and non-critical is only
+whether the workflow function `check`s the result or captures it as `T|error` — see Phase 12.
 
 ---
 
@@ -363,35 +341,24 @@ arguments**, not `msgCtx.setProperty()`/`getPropertyWithType()`.
 ## Phase 11: Configuration (`Config.toml`)
 
 Always externalize connection parameters — never hardcode hosts, ports, or credentials in `.bal`
-files. In addition to the usual per-connector config, every project from this skill needs a
-`[ballerina.workflow]` block:
+files. In addition to the usual per-connector config (listener ports, destination hosts, service
+URLs, a `[db]` block), every project from this skill needs a `[ballerina.workflow]` block:
 
 ```toml
-mllpListenPort = 2575
-destinationHost = "localhost"
-destinationPort = 2576
-fhirServerUrl = "https://fhir.example.com/fhir/r4"
-
 [ballerina.workflow]
 mode = "LOCAL"
 url = "localhost:7233"
 namespace = "default"
 taskQueue = "<CHANNEL_NAME>_QUEUE"
-
-[db]
-host = "localhost"
-port = 3306
-user = "dbuser"
-password = ""   # set via environment: BAL_CONFIG_SECRET_db_password
-database = "mirthdb"
 ```
 
-- `mode = "LOCAL"` for local dev against `temporal server start-dev`; `CLOUD` or `SELF_HOSTED` for
-  real deployments (see `ballerina/workflow`'s own configuration guide for those fields).
-- `taskQueue` must be unique per deployment — name it after the channel, e.g.
-  `ORDER_ADMIT_CHANNEL_QUEUE`, so it doesn't collide with other channels' workers sharing the same
-  Temporal cluster/namespace.
-- For database `DbConfig` records, annotate the password field with `@sql:SensitiveConfig`.
+`mode = "LOCAL"` targets `temporal server start-dev`; `CLOUD` or `SELF_HOSTED` for real deployments
+(see `ballerina/workflow`'s own configuration guide for those fields). `taskQueue` must be unique
+per deployment — name it after the channel, e.g. `ORDER_ADMIT_CHANNEL_QUEUE`, so it cannot collide
+with other channels' workers sharing a Temporal cluster/namespace. Secrets never go in the file
+(set them via `BAL_CONFIG_SECRET_*`), and a `DbConfig` password field is annotated
+`@sql:SensitiveConfig`. Phase 1B's `Config.verification.toml` overrides these same keys — nothing
+else — to point the project at the mocks.
 
 ---
 
@@ -405,22 +372,15 @@ chance to act (or the review task itself times out / is resolved as "fail it").
 
 ### Step 1 — classify each destination
 
-| Mirth signal | Classification |
-|---|---|
-| Queue mode "Never" and the channel has no fallback path if this destination fails | Critical |
-| The channel's primary business outcome depends on this destination succeeding (e.g. the record store, the primary downstream system) | Critical |
-| Side-channel effects — email notification, audit log, analytics/metrics export, a "nice to have" secondary copy | Non-critical |
-| Queue mode "On Failure" with a bounded retry count, where the channel keeps going regardless of outcome | Non-critical |
+Critical when the channel's primary business outcome depends on it succeeding (the record store,
+the primary downstream system), or its queue mode is "Never" with no fallback path. Non-critical
+when it is a side-channel effect — notification, audit log, analytics export, a secondary copy —
+or its queue mode is "On Failure" and the channel keeps going regardless. Unlike a project where
+the retry mechanism varies by classification, here classification only decides `check` vs.
+`T|error`; the `retryPolicy` shape (`ReviewTaskDefinition`) is the same either way (Phase 7). See
+`references/retry-and-skip-mapping.md` for the full signal table.
 
-Unlike a project where retry mechanism varies by classification, here classification only decides
-`check` vs. `T|error` — the `retryPolicy` shape (`ReviewTaskDefinition`) is the same either way
-(Phase 7).
-
-### Step 2 — define the two error types once, in `types.bal`
-
-See "Error Types — Required in Every Project" near the top of this file for the full usage rule.
-
-### Step 3 — translate as sequential `ctx->callActivity()` calls, every one with a human-review `retryPolicy`
+### Step 2 — translate as sequential `ctx->callActivity()` calls, every one with a human-review `retryPolicy`
 
 See `references/error-handling-example.md` for the full worked example (`processOrder`, with two
 critical and two non-critical destinations) and the notes that make it correct rather than just
@@ -432,29 +392,55 @@ completion surface, whose exact decision-payload shape should be confirmed again
 
 ---
 
-## Phase 13: Generating a Test Scenario
+## Phase 13: Verify Against the Mocks, and Report
 
-Every migrated project from this skill includes a runnable test that exercises the workflow
-end-to-end without needing a real Temporal server, plus tests that specifically prove: the
-skip-on-failure behavior for a non-critical destination, that a critical-destination failure
-propagates and fails the workflow, and that the source connector always acknowledges even when the
-underlying workflow fails. See `references/test-scenario-examples.md` for:
+This phase has two halves and **both are required**. 13.1 is the in-process `bal test` suite that
+ships with the project, and it is where **all failure behavior** is verified — skip-on-failure,
+critical-failure propagation, and the source's always-acknowledge convention. 13.2–13.3 stand the
+whole integration up against the Phase 1B mocks and verify **functional correctness on the success
+path only**: real listeners, real clients, real config, every mock accepting. Neither replaces the
+other — a red test suite means the logic mishandles failure; a red verification run means the
+translation itself is wrong.
 
-- `tests/Config.toml`, forcing `mode = "IN_MEMORY"` so tests run fast and in-process.
-- The happy-path test, the skip-on-failure and critical-failure tests, and the
-  always-acks-at-the-source test.
+### 13.1 The in-process test suite
 
-**Two things every generated test suite must get right, not just plausibly resemble:**
+Every migrated project includes a runnable test that exercises the workflow end-to-end without a
+real Temporal server, plus tests that specifically prove: skip-on-failure for a non-critical
+destination, that a critical-destination failure propagates and fails the workflow, and that the
+source connector always acknowledges even when the underlying workflow fails.
+`references/test-scenario-examples.md` has `tests/Config.toml` (forcing `mode = "IN_MEMORY"`) and
+all four tests, plus two things the generated suite must get right rather than merely resemble: a
+test that drives a destination to fail and then calls `workflow:getWorkflowResult()` **will hang**
+unless it first resolves the review task that failure raised (every `// TODO: resolve the review
+task` there is a real gap to close), and failure must be driven through test configuration — an
+address nothing listens on, an invalid input — since `ballerina/workflow` has no documented
+activity-mocking facility to fabricate.
 
-- Because every activity uses a human-review `retryPolicy` (Phase 7/12), a test that drives a
-  destination to fail and then immediately calls `workflow:getWorkflowResult()` **will hang**
-  unless it first resolves the review task the failure raised. Every such `// TODO: resolve the
-  review task` in the reference examples is a real gap the generated test must close, not
-  decoration — do not ship a test suite with it unresolved and call it passing.
-- There is no documented activity-mocking facility in `ballerina/workflow` — drive failure through
-  test-environment configuration (an address nothing listens on, an invalid input), not a
-  fabricated mocking API, and keep it deterministic so the skip-on-failure guarantee it demonstrates
-  is trustworthy.
+### 13.2 Run the generated project against the mocks
+
+Build both packages, start the mocks and poll their ports for readiness, start the project with
+`BAL_CONFIG_FILES=verification/Config.verification.toml bal run`, then drive each scenario through
+its source driver in a declared order, resetting the recorder between scenarios. Configuration
+only: if a `.bal` file has to be edited to reach a mock, that is a hardcoded endpoint to fix in the
+project (Phase 11) and record as a finding. Every mock behaves identically in every scenario, so
+only the input varies and no review task is ever raised to resolve — a scenario that hangs or ends
+in error is a finding about the generated project, not a path being exercised. Never report metrics
+for a project that did not build. `references/mock-service-examples.md` has the full run procedure.
+
+### 13.3 The verification report
+
+Write `verification/report/migration-verification-report.md` covering **accuracy** (assertions
+matched over total *verifiable* assertions — `unverifiable` entries excluded and listed separately
+— reported overall, per scenario and per destination), **latency** (per scenario and per activity,
+with the `IN_MEMORY`/local-mock caveat stated so nobody reads it as an SLA), **token usage** (the
+migration agent's own consumption by stage; never estimated — "not available in this environment"
+when the session does not expose it), the **tested scenarios** table, and **findings** classified
+by where the fix belongs. State the scope plainly: every scenario is a success path, and failure
+handling is covered by 13.1, or a high figure will be over-read. Re-run after repairs and report
+the delta across iterations.
+
+`references/verification-report-template.md` has the full skeleton and the metric definitions —
+read it before computing any number, since a figure with the wrong denominator is worse than none.
 
 ---
 
@@ -473,7 +459,14 @@ After analyzing the channel XML, output **all files in sequence** using labeled 
 ### tests/Config.toml
 ### tests/resources/sample-input.json   (or .hl7 — match the channel's data type)
 ### tests/workflow_test.bal
+### verification/Config.verification.toml
+### verification/mocks/   (Ballerina.toml, Config.toml, mock_destinations.bal, source_drivers.bal, recorder.bal)
+### verification/scenarios/   (scenarios.json + inputs/<scenario-id>.* — one per scenario)
+### verification/report/migration-verification-report.md
 ```
+
+The `verification/*` files are authored in Phase 1B — before the project's own code — even though
+they are emitted last here; the report is the one file filled in at the end, from the Phase 13 run.
 
 After all files, include a **Migration Notes** section with these subsections:
 
@@ -493,7 +486,13 @@ After all files, include a **Migration Notes** section with these subsections:
    (see stance at the top of this file), persistent channel maps, attachment handling, Channel
    Writer cross-channel routing, synchronous source-connector error responses (Phase 3 always acks
    instead) — with the suggested workaround.
-7. **How to run** —
-   - Local dev: `temporal server start-dev`, then `bal run` (uses `mode = "LOCAL"` from the root
-     `Config.toml`).
-   - Tests: `bal test` (uses `mode = "IN_MEMORY"` from `tests/Config.toml`, no server needed).
+7. **Verification summary** — headline accuracy, latency and token-usage figures from the Phase 13
+   run, the scenario pass/fail count, and a pointer to
+   `verification/report/migration-verification-report.md`. Name anything the run could not verify
+   (Phase 1B `unverifiable` entries) here too, so nobody reads a high accuracy figure as broader
+   coverage than it was.
+8. **How to run** — local dev: `temporal server start-dev`, then `bal run` (`mode = "LOCAL"` from
+   the root `Config.toml`). Tests: `bal test` (`mode = "IN_MEMORY"` from `tests/Config.toml`, no
+   server needed). Verification: `bal run verification/mocks`, then
+   `BAL_CONFIG_FILES=verification/Config.verification.toml bal run` in the project, then drive the
+   scenarios (Phase 13.2) — no Temporal server needed, the override sets `IN_MEMORY` mode.
